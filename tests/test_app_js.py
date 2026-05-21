@@ -718,6 +718,64 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
 
 import subprocess  # noqa: E402
 
+
+def _slice_balanced_body(body: str, anchor: int) -> str | None:
+    """Slice ``body`` from ``anchor`` (which must point at or just before
+    the opening ``{`` of a block) up to and including the matching ``}``.
+    Tracks brace depth + string state so the slice is robust to comment
+    growth and arbitrary body reorganisation.  Returns ``None`` if the
+    matching brace isn't found within a reasonable window.
+
+    Used to slice JS handler / function bodies for static assertions
+    without committing to a fixed character window."""
+    n = len(body)
+    i = body.find("{", anchor)
+    if i == -1 or i - anchor > 200:
+        return None
+    depth = 0
+    in_str: str | None = None
+    start = i
+    while i < n and i - start < 8000:
+        ch = body[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return body[start : i + 1]
+        i += 1
+    return None
+
+
+def _slice_listener_body(body: str, event_name: str) -> str | None:
+    """Return the handler-function body registered via
+    ``addEventListener("<event_name>", function ...)``, sliced by
+    matching braces (robust to comment / formatting growth)."""
+    anchor = body.find(f'addEventListener("{event_name}"')
+    if anchor == -1:
+        return None
+    return _slice_balanced_body(body, anchor)
+
+
+def _slice_function_body(body: str, fn_name: str) -> str | None:
+    """Return the body of ``function <fn_name>(...) { ... }`` sliced by
+    matching braces."""
+    m = re.search(r"function\s+" + re.escape(fn_name) + r"\s*\(", body)
+    if m is None:
+        return None
+    return _slice_balanced_body(body, m.start())
+
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 # Bundles that completed the var → const/let sweep.  Add a new JS file
 # here only after it has itself been swept — the var-free + const-reassign
@@ -1080,3 +1138,69 @@ def test_redact_api_keys_runtime_smoke() -> None:
     assert proc.returncode == 0, (
         f"_redactApiKeys runtime smoke failed.  stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
+
+
+def test_beforeunload_closes_sse_connections() -> None:
+    """Pin the multi-pane refresh mitigation: the ``beforeunload``
+    handler closes ``globalEvtSource`` and every pane's ``evtSource``
+    before the page navigates away, freeing the browser's HTTP/1.1
+    6-connection-per-host budget so the refresh document fetch can
+    open a slot.  Without this handler, refresh at MAX_PANES hangs
+    in Chrome and leaves Firefox stuck on the loading state.
+
+    This is a tactical mitigation; the real fix is the console SSE
+    fan-in (one connection per page).  Pinning the handler here
+    prevents a future refactor from silently dropping it before
+    the fan-in lands."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    handler = _slice_listener_body(body, "beforeunload")
+    assert handler is not None, "beforeunload handler missing — refresh at MAX_PANES will hang."
+    assert "globalEvtSource" in handler, "beforeunload handler must reference globalEvtSource."
+    assert ".close()" in handler, "beforeunload handler must close at least one connection."
+    assert "panes" in handler, "beforeunload handler must reference the panes registry."
+    # Either bare `evtSource.close()` or `disconnectSSE()` (which closes +
+    # clears pending timers) is acceptable for per-pane teardown — pin the
+    # behaviour, not the implementation.
+    assert ".disconnectSSE()" in handler or ".evtSource.close()" in handler, (
+        "beforeunload handler must tear down per-pane SSEs "
+        "(`Pane.disconnectSSE()` is preferred — it also clears pending timers)."
+    )
+
+
+def test_dead_sse_defensive_reconnect_registered() -> None:
+    """Pin the defensive reconnect: visibilitychange + focus listeners
+    must re-establish SSE connections that were closed by beforeunload
+    when the navigation didn't actually complete (e.g. another
+    beforeunload handler's "Are you sure?" dialog dismissed).  Without
+    these, the page stays alive with dead SSEs and no automatic
+    recovery — UI silently stops receiving events.
+
+    The two listeners cover different cancellation shapes: visibilitychange
+    catches hide/show; focus catches modal/browser-UI/OS-level focus loss
+    and return.  Both call the same idempotent reconnect helper."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    # Both event registrations must be present.
+    assert 'addEventListener("visibilitychange"' in body, (
+        "visibilitychange listener missing — defensive reconnect won't fire on tab return."
+    )
+    assert 'addEventListener("focus"' in body, (
+        "focus listener missing — defensive reconnect won't catch "
+        "modal-dismissed cancellation paths."
+    )
+    # The reconnect helper must inspect EventSource state and call the
+    # existing connect helpers.  Slice the helper's body by walking the
+    # matching `}` so the assertions are robust to comment growth + body
+    # reorganisation.
+    helper_body = _slice_function_body(body, "_reconnectDeadSSEs")
+    assert helper_body is not None, (
+        "_reconnectDeadSSEs helper missing — reconnect logic must live in "
+        "a named function the listeners can share."
+    )
+    assert "EventSource" in helper_body, (
+        "_reconnectDeadSSEs must inspect EventSource state so live or "
+        "CONNECTING sockets aren't disrupted."
+    )
+    assert "connectGlobalSSE()" in helper_body, (
+        "_reconnectDeadSSEs must reconnect the global SSE when closed."
+    )
+    assert "connectSSE(" in helper_body, "_reconnectDeadSSEs must reconnect dead per-pane SSEs."
