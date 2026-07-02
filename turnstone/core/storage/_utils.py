@@ -1041,21 +1041,42 @@ HISTORY_VISIBILITY_SCOPE_SQL = (
     ") "
 )
 
+# Live-context exclusion for the model-facing recall tool: drop rows of ONE
+# workstream (the caller's own) above its compaction checkpoint — those rows
+# are the live segment, already in the model's context, and returning them
+# wastes result slots on duplicates.  Rows at or below the checkpoint are the
+# summarized-away past: exactly what recall exists to re-derive.
+# ``:excl_after`` = the checkpoint boundary, or ``-1`` for a never-compacted
+# workstream — the whole conversation is live then, so the whole workstream
+# is excluded.  Human-facing surfaces (the /history command) deliberately do
+# NOT apply this: a person browsing history has no "context" to duplicate.
+
+HISTORY_CONTEXT_EXCLUSION_SQL = "AND NOT (c.ws_id = :excl_ws AND c.id > :excl_after) "
+
 
 def _is_compaction_marker(row: Any) -> bool:
     """True when a stored row is a compaction checkpoint marker (``_source`` = row index 7)."""
     return len(row) > 7 and row[7] == COMPACTION_SOURCE
 
 
-def _compaction_watermark(row: Any) -> int | None:
-    """Read a marker row's checkpoint watermark from its ``meta`` column (row index 10).
+def parse_checkpoint_watermark(meta_json: str | None) -> int | None:
+    """Parse a compaction marker's ``meta`` JSON into its watermark id.
 
-    Returns the boundary conversation id, or ``None`` for a marker that predates
-    the watermark field or whose meta is malformed (caller falls back to the full
-    transcript — never load *less* than is safe)."""
-    meta = _source_meta_from_json(row[10] if len(row) > 10 else None)
+    The single decoder for the checkpoint boundary — shared by the resume
+    slice (:func:`reconstruct_turns_checkpointed` via
+    :func:`_compaction_watermark`) and the backends'
+    ``get_compaction_checkpoint``.  Returns ``None`` for a marker that
+    predates the watermark field or whose meta is malformed (callers fall
+    back to safe behavior: resume loads the full transcript, recall excludes
+    the whole workstream — never *less* safe than the honest answer)."""
+    meta = _source_meta_from_json(meta_json)
     wm = meta.get("watermark") if meta else None
     return wm if isinstance(wm, int) and not isinstance(wm, bool) else None
+
+
+def _compaction_watermark(row: Any) -> int | None:
+    """Read a marker row's checkpoint watermark from its ``meta`` column (row index 10)."""
+    return parse_checkpoint_watermark(row[10] if len(row) > 10 else None)
 
 
 def reconstruct_turns_checkpointed(
@@ -1076,10 +1097,13 @@ def reconstruct_turns_checkpointed(
     watermark]`` — the in-memory view the session held when it compacted. The
     summarized prefix and any older markers (id <= watermark) are dropped; the
     full history stays in storage for ``/history``/export/audit. The marker
-    reconstructs as a plain ``assistant`` turn (``reconstruct_turns`` drops
-    ``_source`` for assistant rows), and a synthetic ``[Conversation summary]``
-    user label is prepended to match what ``session._compact_messages`` builds
-    in memory (and to satisfy the leading-user-turn wire contract).
+    reconstructs as an ``assistant`` turn re-tagged ``source="compaction"``
+    (``reconstruct_turns`` drops ``_source`` for assistant rows), and a
+    synthetic ``[Conversation summary]`` user label — tagged likewise — is
+    prepended to match what ``session._compact_messages`` builds in memory
+    (and to satisfy the leading-user-turn wire contract).  The tags keep
+    provenance-testing consumers (``_find_turn_boundaries``, title gen)
+    working identically across a reopen.
 
     Falls back to the full reconstruction when there is no marker or its watermark
     is absent/corrupt, so every pre-checkpoint session loads exactly as before.
@@ -1108,9 +1132,12 @@ def reconstruct_turns_checkpointed(
     # slices separately so the summary leads regardless of row-id ordering (a
     # preserved tail kept verbatim sits at a *lower* id than the marker).
     tail = [r for r in rows if r[0] > watermark and not _is_compaction_marker(r)]
-    label = Turn(Role.USER, _content_blocks(COMPACTION_SUMMARY_LABEL, []))
+    label = Turn(Role.USER, _content_blocks(COMPACTION_SUMMARY_LABEL, []), source=COMPACTION_SOURCE)
+    marker_turns = reconstruct_turns([marker], ws_id, attachments_by_msg)
+    for t in marker_turns:
+        t.source = COMPACTION_SOURCE
     return [
         label,
-        *reconstruct_turns([marker], ws_id, attachments_by_msg),
+        *marker_turns,
         *reconstruct_turns(tail, ws_id, attachments_by_msg),
     ]

@@ -68,6 +68,7 @@ from turnstone.core.memory import (
     delete_structured_memory_by_id,
     delete_workstream,
     get_attachments,
+    get_compaction_checkpoint,
     get_compaction_floor,
     get_compaction_watermark,
     get_skill_by_name,
@@ -2710,7 +2711,11 @@ class ChatSession:
         return used > self.context_window * min(0.95, self.auto_compact_pct + 0.10)
 
     def _do_auto_compact(
-        self, where: str = "", preserve_tail: int = 0, my_generation: int = 0
+        self,
+        where: str = "",
+        preserve_tail: int = 0,
+        my_generation: int = 0,
+        carry_spill: bool = False,
     ) -> bool:
         """Emit the auto-compaction notice, compact, and refresh the status
         line.  Shared by the mid-turn policy (:meth:`_maybe_compact_midturn`)
@@ -2720,7 +2725,9 @@ class ChatSession:
         is forwarded to :meth:`_compact_messages` (e.g. to keep an in-flight
         tool-call turn during compact-before-truncate); ``my_generation`` is
         forwarded so the message swap aborts if a newer send supersedes this one
-        mid-compaction (0 = the manual /compact path, which has no generation).
+        mid-compaction (0 = the manual /compact path, which has no generation);
+        ``carry_spill`` is forwarded so the end-of-turn site can copy the
+        model's wind-down turn onto the summary verbatim.
         Returns whether a summary was actually produced (False if compaction
         bailed) so callers can avoid acting on a compaction that did not happen."""
         qualifier = f" {where}" if where else ""
@@ -2729,7 +2736,10 @@ class ChatSession:
             f"\n[Auto-compacting{qualifier}: prompt exceeds {pct_display}% of context window]"
         )
         compacted = self._compact_messages(
-            auto=True, preserve_tail=preserve_tail, my_generation=my_generation
+            auto=True,
+            preserve_tail=preserve_tail,
+            my_generation=my_generation,
+            carry_spill=carry_spill,
         )
         self._print_status_line()
         return compacted
@@ -2795,11 +2805,11 @@ class ChatSession:
             asst_msg = ""
             for m in list(self.messages):
                 content = m.text  # joins text blocks; multipart attachments contribute none
-                # Skip the synthetic [Conversation summary] turn: after a compaction
-                # it is messages[0], and titling from the bare label yields a
-                # meaningless title (the same summary-turn-as-real-turn hazard
-                # _find_turn_boundaries guards for retry/rewind).
-                if m.role is Role.USER and not user_msg and content != COMPACTION_SUMMARY_LABEL:
+                # Skip the synthetic [Conversation summary] turn (source tag,
+                # not content match — same rule as _find_turn_boundaries):
+                # after a compaction it is messages[0], and titling from the
+                # bare label yields a meaningless title.
+                if m.role is Role.USER and not user_msg and m.source != COMPACTION_SOURCE:
                     user_msg = content[:300]
                 elif m.role is Role.ASSISTANT and not asst_msg:
                     asst_msg = content[:200]
@@ -4141,6 +4151,7 @@ class ChatSession:
     _MAX_SUMMARY_DEPTH = 5  # recursion ceiling before bailing
     _MIN_SUMMARY_BUDGET_CHARS = 2000  # floor so a tiny window still makes progress
     _MIN_SUMMARY_OUTPUT_TOKENS = 512  # floor on summary output even on a tiny window
+    _MIN_CARRY_BUDGET_CHARS = 2000  # floor on verbatim carry (ask quote / wind-down spill)
 
     def _get_health_tracker(self) -> BackendHealthTracker | None:
         """Get the health tracker for this session's current backend.
@@ -4945,7 +4956,12 @@ class ChatSession:
                         # its own thinking start/stop) to avoid nested spinners.
                         self.ui.on_thinking_stop()
                         try:
-                            self._compact_messages(auto=True)
+                            # my_generation: without it a stale send that hits
+                            # overflow here could compact-and-swap the LIVE
+                            # generation's history after a force-cancel started
+                            # a newer one — the same race every other compaction
+                            # site already guards.
+                            self._compact_messages(auto=True, my_generation=my_generation)
                             msgs = self._prepare_wire_messages(self._full_messages())
                             self.ui.on_thinking_start()
                             stream = self._create_stream_with_retry(msgs)
@@ -5031,7 +5047,12 @@ class ChatSession:
                     # consumed above — compact whenever over soft.  None-safe via
                     # _estimated_prompt_tokens(), so no _last_usage guard.
                     if self._over_soft(self._estimated_prompt_tokens()):
-                        compacted = self._do_auto_compact(my_generation=my_generation)
+                        # carry_spill: when the model stopped to let us compact,
+                        # its final turn is the plan spill the advisory asked
+                        # for — copy it across verbatim, don't just paraphrase.
+                        compacted = self._do_auto_compact(
+                            my_generation=my_generation, carry_spill=stopped_to_compact
+                        )
                         # _do_auto_compact's summary call is slow; unlike the
                         # mid-turn siblings this site also PERSISTS the resume
                         # turn, so re-check the generation didn't change during
@@ -5483,14 +5504,15 @@ class ChatSession:
         artifact, not a real turn: as a retry/rewind target it would re-send the
         bare label and regenerate over it (clobbering the summary), and as the
         pre-send ``preserve_tail`` anchor it would preserve the label instead of
-        the real question.  (A user who literally types the label leaves no real
-        boundary — retry/rewind then correctly no-op, and the pre-send caller's
-        own ``else`` fallback keeps the trailing turn.)
+        the real question.  Tested by the ``source`` tag both producers set
+        (:meth:`_compact_messages` in memory, ``reconstruct_turns_checkpointed``
+        on resume), not by content — so a user who literally types the label
+        keeps a real boundary, and retry/rewind treat their message normally.
         """
         return [
             i
             for i, m in enumerate(self.messages)
-            if m.role is Role.USER and (m.text or "") != COMPACTION_SUMMARY_LABEL
+            if m.role is Role.USER and m.source != COMPACTION_SOURCE
         ]
 
     def _persist_truncation(self, removed_count: int) -> None:
@@ -6306,6 +6328,35 @@ class ChatSession:
         window_cap = max(self._MIN_SUMMARY_OUTPUT_TOKENS, self.context_window // 2)
         return min(hard_cap, window_cap)
 
+    def _carry_budget_chars(self, carries: int = 1) -> int:
+        """Per-carry char budget for content carried VERBATIM across a
+        compaction — the continuation hint's quote of the user's last
+        message, and the wind-down spill.
+
+        A quarter of the window per carry, clamped so ALL concurrent carries
+        fit what the window spares after the summary output reserve AND the
+        fixed prompt overhead (system message + tool definitions — the same
+        terms the ``_estimated_prompt_tokens`` fallback counts, because they
+        ride every request): the carried text lands in the same
+        post-compaction prompt as all of those, so
+        ``overhead + reserve + carries·budget + margin ≤ window`` must hold
+        by construction — sizing carries independently (or ignoring the
+        overhead) stacks past the window at default config exactly when
+        spill and hint fire together, and the overflow backstop would then
+        re-compact WITHOUT the carries.  Floored at
+        ``_MIN_CARRY_BUDGET_CHARS`` so small windows still carry something
+        meaningful; when the floor exceeds the spare (a tiny window, or a
+        system prompt that fills it) the floor wins deliberately — carrying
+        something beats carrying nothing, and the overflow backstop absorbs
+        the worst case.  Chars via the calibrated ``_chars_per_token``.
+        """
+        reserve = self._summary_output_tokens()
+        margin = int(self.context_window * self._SUMMARY_SAFETY_MARGIN)
+        overhead = self._system_tokens + self._tool_def_tokens()
+        spare = max(0, self.context_window - reserve - margin - overhead)
+        budget_tokens = min(self.context_window // 4, spare // max(1, carries))
+        return max(self._MIN_CARRY_BUDGET_CHARS, int(budget_tokens * self._chars_per_token))
+
     def _summary_input_budget_chars(self) -> int:
         """Per-call input budget for a summary completion, in characters.
 
@@ -6340,18 +6391,22 @@ class ChatSession:
 
     @staticmethod
     def _truncate_block(block: str, budget: int) -> str:
-        """Hard-truncate a single oversized block to ``budget`` chars, keeping the
-        head and tail around a ``…[truncated]…`` marker.
+        """Hard-truncate a single oversized block to ``budget`` chars, keeping
+        the head and tail around a marker that reports the ORIGINAL size — the
+        reader (the summarizer, or on the verbatim-carry paths the
+        post-compaction model) sees how much is missing, not just that a cut
+        happened.
 
-        Only used for a lone block that can't fit any batch — the one lossy path
-        in chunked compaction.  The result is always ``<= budget``.
+        Used for a lone block that can't fit any summary batch, and for the
+        verbatim carries (ask quote / wind-down spill).  The result is always
+        ``<= budget``.
         """
         if len(block) <= budget:
             # Already fits — return as-is.  Without this, a budget wider than the
             # block makes the head slice ``block[:head]`` and tail slice
             # ``block[-tail:]`` overlap and DUPLICATE content around the marker.
             return block
-        marker = "\n…[truncated]…\n"
+        marker = f"\n…[truncated — {len(block):,} chars total]…\n"
         if budget <= len(marker):
             return block[:budget]
         keep = budget - len(marker)
@@ -6530,7 +6585,11 @@ class ChatSession:
                     budget = max(self._MIN_SUMMARY_BUDGET_CHARS, budget // 2)
 
     def _compact_messages(
-        self, auto: bool = False, preserve_tail: int = 0, my_generation: int = 0
+        self,
+        auto: bool = False,
+        preserve_tail: int = 0,
+        my_generation: int = 0,
+        carry_spill: bool = False,
     ) -> bool:
         """Compact conversation history by summarizing it into a summary turn.
 
@@ -6541,12 +6600,22 @@ class ChatSession:
         most-recent messages are no longer silently dropped.
 
         When auto=True (triggered by context limit), appends a continuation
-        hint with the last user message so the model can resume seamlessly.
+        hint quoting the last user message — verbatim up to
+        :meth:`_carry_budget_chars` — so the model can resume seamlessly.
 
         ``preserve_tail`` keeps the last N messages verbatim (re-appended after
         the summary) instead of summarizing them — used to keep an in-flight
         assistant tool-call turn so the tool results appended after compaction
         aren't orphaned from their ``tool_use``.
+
+        ``carry_spill`` copies the final summarized assistant turn's text onto
+        the summary under a ``## Wind-down (verbatim)`` heading — shell
+        concatenation, not summarizer output.  The end-of-turn site sets it
+        when the model stopped *because it was advised* to wrap up: that turn
+        holds the goal/remaining-tasks/next-steps the advisory asked it to
+        record, and the plan must cross a compaction copied, not paraphrased —
+        the summarizer also reads the spill, but its paraphrase must not be
+        the only survivor.
         """
         # Clear the cooperative latch on every compaction *attempt*, ahead of
         # the early-return guards below — a bailed compaction (too few/large
@@ -6609,15 +6678,55 @@ class ChatSession:
             self.ui.on_info("Compaction produced an empty summary; keeping history.")
             return False
 
+        # The verbatim carries: the wind-down spill and the continuation-hint
+        # quote of the ask.  Both can fire on the SAME compaction (the
+        # end-of-turn site), so they must share ONE budget — sized per-carry
+        # against each other, the summary reserve stacks past the window at
+        # default config (reserve cw/2 + 2·(cw/4) + margin > cw) and the
+        # overflow backstop would then re-compact WITHOUT the spill,
+        # paraphrasing away exactly what this carries.
+        spill_text = ""
+        if carry_spill and to_summarize:
+            # to_summarize[-1] is the model's final turn only because the
+            # end-of-turn site passes preserve_tail=0; a carry_spill caller
+            # with preserve_tail > 0 must locate the spill ahead of the
+            # preserved tail instead.
+            spill = to_summarize[-1]
+            if spill.role is Role.ASSISTANT:
+                spill_text = (spill.text or "").strip()
+        carries = (1 if spill_text else 0) + (1 if last_user_content else 0)
+        carry_budget = self._carry_budget_chars(carries) if carries else 0
+
+        # Wind-down first, then how to resume — the summary reads: sections,
+        # what the model recorded, then the ask to continue from.
+        carry_truncated = False
+        if spill_text:
+            carry_truncated = len(spill_text) > carry_budget
+            summary += "\n\n## Wind-down (verbatim)\n" + self._truncate_block(
+                spill_text, carry_budget
+            )
+
         # Append continuation hint for auto-compact
         if last_user_content:
-            # Truncate very long user messages
-            if len(last_user_content) > 500:
-                last_user_content = last_user_content[:400] + "..."
+            # The quoted ask crosses verbatim up to the carry budget — the last
+            # user message may BE the task (a pasted spec or diff), so a fixed
+            # few-hundred-char clip amputates it.  Beyond the budget keep head
+            # + tail around an honest marker.
+            carry_truncated = carry_truncated or len(last_user_content) > carry_budget
+            last_user_content = self._truncate_block(last_user_content, carry_budget)
             summary += (
                 f"\n\n## Continue\n"
                 f"The user's last message was: {last_user_content}\n"
                 f"Continue assisting from where we left off."
+            )
+
+        # A truncated carry is a cache miss, not a loss: storage keeps the
+        # full transcript, so tell the model where the rest lives instead of
+        # leaving a bare cut.
+        if carry_truncated:
+            summary += (
+                "\n\nTruncated content above is not lost: the full text remains "
+                "in conversation history and the recall tool can retrieve it."
             )
 
         # Honor a cancel — or a newer generation that superseded this send DURING
@@ -6631,8 +6740,19 @@ class ChatSession:
 
         # Replace messages — summary, then any preserved tail verbatim.
         before_tokens = self._system_tokens + sum(self._msg_tokens) + self._tool_def_tokens()
-        summary_user = {"role": "user", "content": COMPACTION_SUMMARY_LABEL}
-        summary_asst = {"role": "assistant", "content": summary}
+        # Both synthetic turns carry the compaction source tag so consumers
+        # (_find_turn_boundaries, _generate_title) test provenance, not
+        # content — a user who literally types the label stays a real turn.
+        summary_user = {
+            "role": "user",
+            "content": COMPACTION_SUMMARY_LABEL,
+            "_source": COMPACTION_SOURCE,
+        }
+        summary_asst = {
+            "role": "assistant",
+            "content": summary,
+            "_source": COMPACTION_SOURCE,
+        }
         self.messages = turns_from_dicts([summary_user, summary_asst]) + list(preserved)
         # File contents are gone after compaction — force re-read before edit_file
         self._read_files.clear()
@@ -13758,13 +13878,35 @@ class ChatSession:
         return call_id, msg
 
     def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Search conversation history, scoped to the prepare-time user."""
+        """Search conversation history, scoped to the prepare-time user.
+
+        The session's own workstream is searchable only BELOW its compaction
+        checkpoint: rows above it are the live segment, already in context —
+        returning them would spend result slots on duplicates.  Below it is
+        the summarized-away past, exactly what recall exists to re-derive
+        (the summary is a cache over the originals, not their replacement).
+        The boundary is read fresh at execution, not pinned at prepare, so a
+        compaction that ran while the item was queued is respected.
+
+        Known limit: a FORKED session excludes only its own ws — the parent
+        rows it inherited into context remain searchable under the parent's
+        id (and unlabeled, since they aren't this ws).  Harmless duplication
+        bounded by tenancy, and precise dedup needs a fork-time row cursor;
+        not worth carrying until forks matter here.
+        """
         call_id = item["call_id"]
         query, limit, offset = item["query"], item["limit"], item.get("offset", 0)
 
         # KeyError on a missing pin is deliberate — an unpinned item must
         # fail loudly, not fall back to an unscoped (tenant-wide) search.
-        conv_rows = search_history(query, limit, offset, user_id=item["scope_user_id"])
+        conv_rows = search_history(
+            query,
+            limit,
+            offset,
+            user_id=item["scope_user_id"],
+            exclude_ws_id=self._ws_id or None,
+            exclude_after=(get_compaction_checkpoint(self._ws_id) if self._ws_id else None),
+        )
         if conv_rows:
             lines = []
             for ts, sid, role, content, tool_name in conv_rows:
@@ -13772,7 +13914,8 @@ class ChatSession:
                 text = (content or "")[:2000]
                 if content and len(content) > 2000:
                     text += f"... ({len(content)} chars total)"
-                lines.append(f"[{ts} {sid}] {label}: {text}")
+                own = " (earlier in this conversation, compacted)" if sid == self._ws_id else ""
+                lines.append(f"[{ts} {sid}]{own} {label}: {text}")
             header = f"Conversations ({len(conv_rows)} matches"
             if offset:
                 header += f", offset {offset}"
