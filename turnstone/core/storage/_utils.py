@@ -918,6 +918,13 @@ def reconstruct_turns(
             # rows (bare source_meta dict, no effect_status key) fall through.
             if role == "tool" and "effect_status" in raw_meta:
                 meta.extra["effect_status"] = raw_meta["effect_status"]
+            elif role == "user" and "sender" in raw_meta:
+                # Per-message sender identity (shared-workstream attribution).
+                # A USER row's meta blob carries only ``{"sender": ...}`` — route
+                # it to its own key so history replay re-attributes each turn to
+                # the human who sent it (source_meta rides SYSTEM turns, never
+                # user turns, so there is no collision).
+                meta.extra["sender"] = raw_meta["sender"]
             else:
                 meta.extra["source_meta"] = raw_meta
         src = str(source) if source else None

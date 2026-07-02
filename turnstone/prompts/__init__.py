@@ -58,6 +58,7 @@ class SessionContext:
     timezone: str  # system tz abbreviation, required
     username: str  # users.username, required
     project: str = ""  # attached project name, rendered only when the ws has one
+    shared: bool = False  # True once >1 distinct human sends into the workstream
 
 
 # File-based policy-to-tool gating (defaults).
@@ -75,13 +76,34 @@ _ENV_MAP: dict[ClientType, str] = {
 
 
 def _build_context(ctx: SessionContext, kind: WorkstreamKind) -> str:
-    """Build the CONTEXT module from session variables."""
+    """Build the CONTEXT module from session variables.
+
+    In a **shared** workstream more than one person sends messages, so a single
+    ``- **User:**`` line would mislead the model into attributing every turn to
+    the owner.  We instead name the owner and declare the workstream multi-user,
+    pointing the model at the per-message ``[message from <id>]`` tags (added at
+    :meth:`ChatSession._prepare_wire_messages`) as the authoritative per-turn
+    identity.  The single-user line is unchanged for the common case.
+    """
     project_line = f"- **Project:** {ctx.project}\n" if ctx.project else ""
+    if ctx.shared:
+        who_lines = (
+            f"- **Owner:** {ctx.username}\n"
+            "- **Participants:** SHARED workstream — more than one person sends messages "
+            "here. Each user turn is prefixed `[message from <participant>]` with the "
+            "identity of whoever sent it; attribute requests and statements to that sender "
+            "and do NOT assume a single user. Tool / MCP calls execute under the "
+            "credentials of the participant who sent the current message (not the owner), "
+            "so the SAME tool can legitimately return DIFFERENT results for different "
+            "senders — that is expected, not an error or inconsistency.\n"
+        )
+    else:
+        who_lines = f"- **User:** {ctx.username}\n"
     return (
         "## Session Context\n"
         "\n"
         f"- **Current date/time:** {ctx.current_datetime} ({ctx.timezone})\n"
-        f"- **User:** {ctx.username}\n"
+        f"{who_lines}"
         f"{project_line}"
         f"- **Session kind:** {kind.value}"
     )
