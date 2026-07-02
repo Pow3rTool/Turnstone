@@ -125,6 +125,7 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "compaction_pending",
         "idle_children",
         "watch_triggered",
+        "participant_joined",
     }
 )
 

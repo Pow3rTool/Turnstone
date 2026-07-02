@@ -58,6 +58,9 @@ class SessionContext:
     timezone: str  # system tz abbreviation, required
     username: str  # users.username, required
     project: str = ""  # attached project name, rendered only when the ws has one
+    shared: bool = False  # True once >1 distinct human sends into the workstream
+    ws_id: str = ""  # this workstream's stable id — lets the model name "this workstream"
+    project_id: str = ""  # attached project's stable id (human-readable name is ``project``)
 
 
 # File-based policy-to-tool gating (defaults).
@@ -75,13 +78,49 @@ _ENV_MAP: dict[ClientType, str] = {
 
 
 def _build_context(ctx: SessionContext, kind: WorkstreamKind) -> str:
-    """Build the CONTEXT module from session variables."""
-    project_line = f"- **Project:** {ctx.project}\n" if ctx.project else ""
+    """Build the CONTEXT module from session variables.
+
+    In a **shared** workstream more than one person sends messages, so a single
+    ``- **User:**`` line would mislead the model into attributing every turn to
+    the owner.  We instead name the owner and declare the workstream multi-user,
+    pointing the model at the per-message ``[message from <id>]`` tags (added at
+    :meth:`ChatSession._prepare_wire_messages`) as the authoritative per-turn
+    identity.  The single-user line is unchanged for the common case.
+
+    The workstream id and project id are surfaced (when present) so the model
+    can refer to *this* workstream/project by its stable handle — e.g. when
+    registering an out-of-band callback (an alert that should feed follow-ups
+    back into this same workstream) rather than only its display name.  Both
+    are stable for the session, so they don't perturb the cached prompt prefix.
+    """
+    ws_line = f"- **Workstream ID:** {ctx.ws_id}\n" if ctx.ws_id else ""
+    if ctx.project:
+        project_display = ctx.project
+        if ctx.project_id:
+            project_display += f" (id: {ctx.project_id})"
+        project_line = f"- **Project:** {project_display}\n"
+    else:
+        project_line = ""
+    if ctx.shared:
+        who_lines = (
+            f"- **Owner:** {ctx.username}\n"
+            "- **Participants:** SHARED workstream — more than one person sends messages "
+            "here. Each user turn is prefixed `[message from <participant>]` with the "
+            "identity of whoever sent it; attribute requests and statements to that sender "
+            "and do NOT assume a single user. Tool / MCP calls execute under the "
+            "credentials of the participant who initiated the current turn (usually the "
+            "sender, not the owner), so the SAME tool can legitimately return DIFFERENT "
+            "results for different senders — that is expected, not an error or "
+            "inconsistency.\n"
+        )
+    else:
+        who_lines = f"- **User:** {ctx.username}\n"
     return (
         "## Session Context\n"
         "\n"
         f"- **Current date/time:** {ctx.current_datetime} ({ctx.timezone})\n"
-        f"- **User:** {ctx.username}\n"
+        f"{ws_line}"
+        f"{who_lines}"
         f"{project_line}"
         f"- **Session kind:** {kind.value}"
     )

@@ -305,6 +305,14 @@ def turn_from_dict(msg: dict[str, Any]) -> Turn:
     es = msg.get("_effect_status")
     if es:
         meta.extra["effect_status"] = es
+    # Per-message sender identity for shared workstreams (who actually sent this
+    # user turn). Wire-invisible side channel — folded into the model-visible
+    # content at :meth:`ChatSession._prepare_wire_messages` only when the
+    # workstream is multi-user; the ``_``-prefixed key itself never reaches the
+    # provider (stripped by ``sanitize_messages``).
+    sndr = msg.get("_sender")
+    if sndr:
+        meta.extra["sender"] = sndr
 
     return Turn(
         role=role,
@@ -351,6 +359,9 @@ def turn_to_dict(turn: Turn) -> dict[str, Any]:
     es = turn.meta.extra.get("effect_status")
     if es:
         msg["_effect_status"] = es
+    sndr = turn.meta.extra.get("sender")
+    if sndr:
+        msg["_sender"] = sndr
     return msg
 
 

@@ -271,6 +271,29 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
 _IMAGE_SIZE_CAP = _ATTACH_IMAGE_SIZE_CAP
 
 
+def _prefix_sender_label(content: Any, sender: str) -> Any:
+    """Return *content* with a ``[message from <sender>]`` header prepended.
+
+    Handles both the plain-string user content and the multipart list shape
+    (text + attachment parts): the header is folded into the first text part, or
+    inserted as a leading text part when the content is attachment-only.  Returns
+    a new object; the input is never mutated (the caller works on a transient
+    wire copy, not the canonical ``self.messages``)."""
+    label = f"[message from {sender}]\n"
+    if isinstance(content, str):
+        return label + content
+    if isinstance(content, list):
+        out = list(content)
+        for i, part in enumerate(out):
+            if isinstance(part, dict) and part.get("type") == "text":
+                np = dict(part)
+                np["text"] = label + str(np.get("text", ""))
+                out[i] = np
+                return out
+        return [{"type": "text", "text": label.rstrip("\n")}, *out]
+    return content
+
+
 def _encode_image_data_uri(raw: bytes, mime: str) -> str:
     """Wrap raw image bytes as a ``data:{mime};base64,...`` URI."""
     b64 = base64.b64encode(raw).decode("ascii")
@@ -1187,6 +1210,18 @@ class ChatSession:
         # the ``(user_id, callback)`` pair).
         self._acting_user_id: str = ""
         self._mcp_listener_user_id: str | None = user_id or None
+        # Shared-workstream context state (context-identity layer, atop the
+        # acting-user credential fix above): the model must be TOLD when more
+        # than one human is in the room. ``_shared_workstream`` flips True once a
+        # non-owner sender appears (live send OR rehydrated history) and drives
+        # the ``## Session Context`` banner; ``_known_senders`` tracks who has
+        # spoken so a first-time participant gets a one-time "has joined" note.
+        self._shared_workstream: bool = False
+        self._known_senders: set[str] = set()
+        # user_id -> display username cache for shared-workstream labels / join
+        # notes, so senders read as usernames (like the owner banner) not raw
+        # id hashes. Resolved lazily via storage; a handful of entries per ws.
+        self._sender_name_cache: dict[str, str] = {}
         self._username = username
         self._client_type = client_type
         # Whether the user is online to complete an in-flight OAuth
@@ -3101,11 +3136,17 @@ class ChatSession:
             # on every turn that crossed a minute boundary. Hour-precision still
             # gives the model time-of-day awareness without paying for a full
             # prefix recompute every ~60 seconds.
+            # Refresh shared-workstream state so the banner matches the current
+            # participant set (fresh compose or rehydrated multi-user history).
+            self._recompute_shared_state()
             ctx = SessionContext(
                 current_datetime=now.strftime("%Y-%m-%dT%H:00"),
                 timezone=now.tzname() or "UTC",
                 username=self._username or self._user_id or "unknown",
                 project=self._project_name,
+                shared=self._shared_workstream,
+                ws_id=self._ws_id,
+                project_id=self._project_id,
             )
             composed = compose_system_message(
                 client_type=self._client_type,
@@ -3578,6 +3619,127 @@ class ChatSession:
             ),
         }
 
+    def _resolve_display_name(self, user_id: str) -> str:
+        """Resolve a user_id to its display username for shared-workstream
+        labels / join notes — the same *kind* of identity the owner gets in the
+        Session Context banner (``self._username``), rather than a raw id hash.
+
+        The owner short-circuits to ``self._username`` (already known, matches
+        the banner exactly). Others are looked up once via storage and cached on
+        the session; a lookup miss / no user row falls back to the raw id so the
+        label degrades gracefully rather than disappearing."""
+        if not user_id:
+            return ""
+        if user_id == self._mcp_user_id and self._username:
+            return self._username
+        cached = self._sender_name_cache.get(user_id)
+        if cached is not None:
+            return cached
+        name = user_id
+        try:
+            storage = get_storage()
+            if storage:
+                row = storage.get_user(user_id)
+                if row:
+                    name = row.get("username") or row.get("display_name") or user_id
+                # Cache hits and definite misses (row is None). A transient
+                # storage error, by contrast, skips the cache and falls through
+                # to return the raw id, so a later call can retry rather than
+                # pinning the sender to their id for the session's lifetime.
+                self._sender_name_cache[user_id] = name
+        except Exception:
+            log.debug("display-name lookup failed for user=%s", user_id, exc_info=True)
+        return name
+
+    def _recompute_shared_state(self) -> None:
+        """Recompute shared-workstream state from the current trajectory.
+
+        Scans user turns for recorded senders (the ``meta.extra["sender"]``
+        stamped by :meth:`_append_user_turn`). The workstream is *shared* once a
+        sender other than the owner (``_mcp_user_id``) has spoken. Called at
+        system-prompt (re)composition so the ``## Session Context`` banner
+        reflects reality on a fresh compose AND on a worker rehydrating an
+        already-multi-user workstream from history."""
+        owner = (self._mcp_user_id or "").strip()
+        senders = {
+            s
+            for t in self.messages
+            if t.role is Role.USER and (s := (t.meta.extra.get("sender") or "").strip())
+        }
+        self._known_senders = senders
+        self._shared_workstream = any(s != owner for s in senders)
+
+    def _maybe_note_new_participant(self, sender_user_id: str | None) -> None:
+        """Announce a first-time non-owner sender and flip the ws to shared.
+
+        Called from :meth:`send` right after the user turn is appended, with the
+        turn's acting user. The first non-owner sender recomposes the system
+        prefix so the banner switches to multi-user framing; every first-time
+        participant (2nd, 3rd, …) also gets a one-time ``participant_joined``
+        system turn the model sees on that same turn — the "bob has joined the
+        chat" signal, since we can't know a participant exists until they speak.
+        The owner and repeat senders are no-ops."""
+        owner = (self._mcp_user_id or "").strip()
+        s = (sender_user_id or "").strip()
+        if not s or s == owner or s in self._known_senders:
+            return
+        was_shared = self._shared_workstream
+        self._known_senders.add(s)
+        self._shared_workstream = True
+        if not was_shared:
+            # First non-owner sender: recompose so the banner is multi-user.
+            # (_recompute_shared_state re-derives the set from history, which now
+            # includes this sender's just-appended turn — consistent.)
+            self._init_system_messages()
+        name = self._resolve_display_name(s)
+        self._append_system_turn(
+            "participant_joined",
+            f"{name} has joined this shared workstream. Their messages are tagged "
+            f"`[message from {name}]` — attribute them to this sender, not the owner.",
+        )
+
+    def _inject_sender_labels(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fold per-message sender attribution into user turns for the wire.
+
+        The context-layer half of per-user identity: on a genuinely multi-user
+        (shared) workstream the model must be told *who* sent each turn, or it
+        conflates every participant. Only user turns that recorded a real sender
+        (the ``_sender`` side channel from :meth:`_append_user_turn`) are
+        considered — synthetic turns (wake, compaction-resume, advisory) carry
+        none and stay unlabeled.
+
+        "Shared" is authoritative session state (``_shared_workstream`` — flipped
+        once a non-owner speaks and re-derived when a worker rehydrates history).
+        The per-slice sender count is only a fallback for when that state is still
+        unset/uncomputed: keying off the count alone would drop labels whenever
+        compaction narrows the retained wire slice to a single participant on a
+        known-shared workstream, reintroducing the misattribution the banner tells
+        the model these labels prevent. A single-user workstream returns the input
+        unchanged (same object reference — the allocation-free common case
+        ``_prepare_wire_messages`` relies on). The label rides the model-visible
+        ``content``; the wire-invisible ``_sender`` key is stripped downstream by
+        ``sanitize_messages``. ``self.messages`` is never mutated."""
+        if not self._shared_workstream:
+            senders = {
+                s
+                for m in messages
+                if m.get("role") == "user" and (s := (m.get("_sender") or "").strip())
+            }
+            if len(senders) <= 1:
+                return messages
+        out: list[dict[str, Any]] = []
+        for m in messages:
+            sender = (m.get("_sender") or "").strip() if m.get("role") == "user" else ""
+            if sender:
+                nm = dict(m)
+                nm["content"] = _prefix_sender_label(
+                    m.get("content"), self._resolve_display_name(sender)
+                )
+                out.append(nm)
+            else:
+                out.append(m)
+        return out
+
     def _prepare_wire_messages(
         self,
         messages: list[dict[str, Any]],
@@ -3618,6 +3780,10 @@ class ChatSession:
         # threads the dicts ``_full_messages`` already produced straight through —
         # no Turn round-trip per send (``self.messages`` stays the canonical Turn
         # truth; only this transient wire copy is dict-native).
+        # Per-user attribution first: label user turns by sender on shared
+        # workstreams (no-op / same-ref on single-user) BEFORE folding so the
+        # label is part of the content the fold + repair passes carry through.
+        messages = self._inject_sender_labels(messages)
         folded = messages
         if self._provider is not None:
             folded = fold_system_turns(
@@ -4304,6 +4470,17 @@ class ChatSession:
             # auto-resume): marks the turn for audit / replay / UI so it isn't
             # mistaken for real user input.  Stripped at the sanitize boundary.
             user_msg["_source"] = source
+        # Per-message sender identity for shared-workstream attribution (the
+        # context-identity layer atop upstream's acting-user credential fix).
+        # Stamp genuine user turns with the ACTING user — the turn initiator
+        # bound by ``bind_acting_user`` (owner fallback for CLI/eval/internal).
+        # Synthetic turns (wake, compaction-resume, advisory) carry a ``_source``
+        # / ``from_wake`` and stay unstamped so they never get a speaker label.
+        # Rides the wire-invisible ``_sender`` side channel and, below, the
+        # persisted ``meta`` column so history replay re-attributes correctly.
+        sender = "" if (from_wake or source) else (self._mcp_effective_user_id or "").strip()
+        if sender:
+            user_msg["_sender"] = sender
         if attachments:
             # Sibling metadata so live history replay has the same shape
             # as reloaded-from-DB (filenames are not recoverable from an
@@ -4335,12 +4512,18 @@ class ChatSession:
         # longer ride this row — the caller appends them as first-class
         # ``system`` turns AFTER this user turn (uniform attach rule).
         source = user_msg.get("_source")
+        # Persist the sender in the row's ``meta`` JSON (no schema change — the
+        # column already carries opaque per-row metadata). ``reconstruct_turns``
+        # restores it to ``Turn.meta.extra["sender"]`` so a worker rehydrating a
+        # shared workstream re-attributes each user turn.
+        meta_json = json.dumps({"sender": sender}) if sender else None
         message_id = save_message(
             self._ws_id,
             "user",
             user_input,
             source=source if isinstance(source, str) and source else None,
             event_id=self._ui_event_id(),
+            meta=meta_json,
         )
         if attachments and message_id:
             self._persist_attachment_refs(message_id, attachments)
@@ -4665,6 +4848,13 @@ class ChatSession:
             self._queue_user_advisory(*nudge)
 
         self._append_user_turn(user_input, attachments or (), send_id=send_id, from_wake=from_wake)
+        # Context-identity: if a new (non-owner) participant just spoke, flip the
+        # workstream to shared framing (banner recompose) and drop a one-time
+        # "has joined" note so the model learns a second human exists — it can't
+        # know until they send a message. Sourced from the acting user bound
+        # above (empty/owner for CLI/eval/internal turns → no-op).
+        if not from_wake:
+            self._maybe_note_new_participant(self._mcp_effective_user_id)
         # Drained user-channel nudges become first-class ``system`` turns
         # appended AFTER the user turn (uniform attach rule), replacing the
         # legacy per-message ``_reminders`` side-channel splice.
