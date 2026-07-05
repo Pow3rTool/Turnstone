@@ -13,7 +13,28 @@ stable, and the experimental line:
 - **`stable/1.6`** — patch-only (`v1.6.x`)
 - **`main`** — experimental (next major)
 
-## [Unreleased]
+## [1.7.0]
+
+The headline of the 1.7 line is **Personas** — operator-authored control
+over how each workstream composes its system message and capability
+envelope. The rest of the release hardens the pieces a persona leans on:
+concurrent approvals, cross-provider reasoning-effort control, cooperative
+compaction, multi-user session safety, and MCP resilience for unattended
+work.
+
+> **⚠️ Before upgrading:** 1.7.0 adds Alembic migrations `062`–`065`,
+> applied automatically on first start (projects, personas, and two
+> smaller schema tidy-ups). Migration `063` creates the `personas` table
+> with its six seed personas and converts existing `creative_mode`
+> workstreams to the `writer` persona in place. The changes are additive
+> to your conversation data, but — as always — back up your storage before
+> upgrading (`pg_dump` for PostgreSQL; copy the database file for SQLite).
+
+**Breaking changes at a glance** (details in the sections below): the
+`/creative` REPL toggle removed (replaced by the `writer` persona), the
+`turnstone-bootstrap` entry point renamed to `turnstone-doctor`, and the
+approval-status API/SDK field `pending_approval_details` changed from a
+single object to a list (one entry per concurrent approval cycle).
 
 ### Added
 
@@ -31,12 +52,106 @@ stable, and the experimental line:
   `turnstone --persona <name>`); authored in the console's new
   Governance → Personas tab (`persona.{create,read,write}` perms,
   archive-only lifecycle). See `docs/personas.md`.
+- **Projects — governed resource containers** (#724) — group workstreams
+  and their resources under a project (migration `062`), with
+  project-scoped memory, a per-project resources view, a project column on
+  the saved list, and server-enforced private-project workstream
+  visibility.
+- **Task-agent sub-harness** (#732) — a spawned task agent now runs on its
+  own Turn-IR sub-harness with parent-tagged step events: its sub-tool
+  steps nest inside an expandable card in the parent trajectory, its
+  sub-trajectory is recallable, and each agent gets read isolation from
+  its siblings.
+- **MCP static-server autonomous reconnect** (#768) — statically
+  configured MCP servers are now kept live by a health loop
+  (capped-jittered backoff, ping-based liveness) instead of silently
+  staying dead after the first transport drop.
+- **Attachments — capability-gated client-side fallback** — when the
+  active model can't natively handle an attachment, the client degrades
+  gracefully (PDF → extracted text, audio → transcript) instead of
+  failing the turn.
+- **Eval measurement / optimizer split** (#763, #765) — `turnstone-eval`
+  is now a measure-only substrate with the prompt optimizer factored out,
+  plus a new skill-adherence measurement mode.
+- **Deployment examples** — a vLLM + LiteLLM unified-memory inference
+  example showing a 3-model co-resident stack with an HF loader (#686,
+  #688), and an Altair + `vl-convert-python` visualization stack (#685).
+- **Concurrent approvals and a long-session frontend overhaul** (#754,
+  #755, #773, #775) — the live-session frontend was reworked for long
+  runs (the pipeline is wedge-proofed and its hot paths de-O(N)'d), and on
+  top of it a workstream can now hold more than one tool call awaiting
+  approval at a time. Each parallel batch gets its own approval cycle,
+  with one card per pending call in the interactive and coordinator UIs,
+  cycle-keyed tracking in Slack and Discord, and cycle-routed resolution
+  across the server/console/SDK APIs; sub-agent tool gates run the
+  intent-judge pipeline as their own generation. The send button no longer
+  sticks disabled after a batch resolves — orphaned approval cycles are
+  pruned and the app is the sole owner of the button state.
+  *(BREAKING: the `pending_approval_details` field is now a list, oldest
+  first.)*
+- **Reasoning-effort control on every provider lane** (#771, #774) — the
+  session effort knob now reaches local backends too: it drives
+  `chat_template_kwargs` on the anthropic-compatible and openai-compatible
+  lanes and threads through to Gemini and xAI, alongside the commercial
+  providers that handle effort natively. The console surfaces each model's
+  effective effort ladder in plain words and adds an always-on
+  thinking-mode option to the model form. Effort snapping is ordinal —
+  it rounds up and caps at the model's ceiling rather than silently
+  dropping.
+
+### Changed
+
+- **Skills are capability-context, not identity** (#762) — a task agent's
+  identity now comes from its persona; an applied skill's body is demoted
+  to capability context and moved out of the identity system message.
+  Skill-body substitution is unified across every invocation context so
+  the same skill renders identically whether loaded interactively, by the
+  model, or inside a sub-agent.
+- **`turnstone-doctor` replaces `turnstone-bootstrap`** (#718)
+  *(BREAKING)* — the setup/diagnostics entry point is renamed; update any
+  scripts or service units that invoke `turnstone-bootstrap`.
+- **Honest cancellation dispositions** — cancelled or timed-out
+  side-effecting tools now report an `UNKNOWN` disposition rather than a
+  flat failure, tool dispositions are typed (not just prose), and a
+  coordinator cancel propagates down the sub-tree.
+- **Multi-user shared-workstream context** (#750) — in a shared
+  workstream, send is gated to the acting participant while a turn is in
+  flight (both the interactive and coordinator surfaces), cross-user
+  mid-turn interjections are blocked, and shared-workstream state plus
+  fork sender attribution are now durable.
+- **Cooperative compaction** (#730) — the context budget is anchored to
+  the provider's true capacity, the summary call is chunked so it can't
+  overflow, and the active plan and the outstanding ask are carried across
+  compaction verbatim. The `recall` tool is scoped to the compacted-away
+  past.
+- **Intent judge sees the full tool arguments** (#760) — the judge's
+  argument projection is no longer narrowed, so it stops issuing confident
+  false denials on a partial view. The output-guard judge sources its real
+  context window, and `context_window = 0` in `config.toml` now means
+  auto-detect.
+
+### Fixed
+
+- **Compaction resume hardening** (#731) — checkpoint markers are
+  persisted so resume rehydration is bounded, context-overflow on resume
+  is recovered across providers, and a recognized rate-limit is no longer
+  misclassified as context overflow.
+- **MCP unattended-work resilience** (#706, #742, #767) — dead-transport
+  handling is completed, consented OAuth (OBO) tokens are refreshed
+  proactively so autonomous runs don't strand on an expired grant, the
+  Entra ID on-behalf-of impersonation flow blockers are closed (migration
+  `065` adds the OIDC `oid`), and OAuth refresh failures are classified so
+  a transient blip never revokes consent nor a dead grant strands the
+  user.
+- **Memory writes** (#735) — save/update is a single atomic upsert, and
+  writing a memory no longer recomposes the system prefix mid-session.
 
 ### Removed
 
-- **`/creative` removed** *(BREAKING)* — the REPL toggle (and its tab
-  completion) is gone; the `writer` seed persona replaces it — start a
-  session with `turnstone --persona writer` or pick *Writer* in the web
+- **`/creative` removed** *(BREAKING)* — subsumed by the Personas feature
+  above: the REPL toggle (and its tab completion) is gone, and the
+  `writer` seed persona replaces it — start a session with
+  `turnstone --persona writer` or pick *Writer* in the web
   pickers. Unlike the old fork, the writer persona composes the full
   system message, so session context and mandatory prompt policies now
   apply to prose-only sessions too. The `creative_mode` key in
@@ -44,6 +159,18 @@ stable, and the experimental line:
   converts existing creative-mode workstreams to the `writer` persona
   automatically, so they resume as writing sessions rather than as
   legacy defaults.
+
+### Security
+
+- **High-risk skill activation is gated** (#762) — a model-initiated load
+  of a `high`- or `critical`-risk skill is gated and fails closed when the
+  backing storage is unavailable, so an untrusted turn can't silently
+  pull in a dangerous capability.
+- **Dependency security floors** — `cryptography` and `starlette` are
+  pinned to security-fixed minimums.
+- **CI publish hardening** — the vendored-JS dispatch path refuses fork
+  PRs, and `workflow_run` publishing is gated to same-repo tag pushes, so
+  a fork can't trigger a release build.
 
 ## [1.6.0]
 
