@@ -5066,6 +5066,10 @@ class ChatSession:
             # MUST keep None — it runs on parallel tool threads and a
             # registration would clobber the main stream's _cancel_stream.
             cancel_ref=cancel_ref,
+            # Per-user OBO backend auth (see main loop) — utility completions on
+            # an entra_obo alias mint under the same driver; static aliases and
+            # userless internal calls resolve None and keep the static key.
+            extra_headers=self._model_auth_headers(lane.alias),
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -5428,6 +5432,10 @@ class ChatSession:
                     replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(
                         model_alias, caps=resolved_caps
                     ),
+                    # Per-user OBO backend auth: override the static client
+                    # credential with a minted bearer for this turn's driver
+                    # (None for static aliases / no user → static key stands).
+                    extra_headers=self._model_auth_headers(model_alias or ""),
                     resolve_attachments=lambda ids: self._resolve_attachments(ids, resolved_caps),
                 )
             except Exception as e:
@@ -5881,6 +5889,43 @@ class ChatSession:
         pre-existing single-user behaviour.
         """
         return self._acting_user_id or self._mcp_user_id
+
+    def _model_auth_headers(self, alias: str) -> dict[str, str] | None:
+        """Per-call credential-header override for an OBO-enabled model backend.
+
+        When *alias*'s ModelConfig has ``auth_mode == "entra_obo"`` and a user
+        is driving the turn, mint a per-user Entra OBO access token for the
+        model's ``obo_audience`` and return it as the provider's credential
+        header (``x-api-key`` for Anthropic surfaces, ``Authorization: Bearer``
+        for OpenAI-style), for passing as ``create_streaming(extra_headers=...)``
+        — which overrides the static credential baked into the SDK client.
+
+        Returns ``None`` (leave the static key in place) for static aliases, an
+        empty/unknown alias, missing user context (CLI / eval / coordinator /
+        service turns, where ``_mcp_effective_user_id`` is empty), or a failed
+        mint — so the call still goes through on the backend's static credential.
+        The mint is cached per (user, audience), so this is a dict lookup on the
+        hot path once warm.
+        """
+        registry = self._registry
+        mcp = self._mcp_client
+        if registry is None or mcp is None or not alias or not registry.has_alias(alias):
+            return None
+        try:
+            cfg = registry.get_config(alias)
+        except ValueError:
+            return None
+        if getattr(cfg, "auth_mode", "static") != "entra_obo" or not cfg.obo_audience:
+            return None
+        user_id = (self._mcp_effective_user_id or "").strip()
+        if not user_id:
+            return None
+        token = mcp.mint_model_obo_token_sync(user_id=user_id, audience=cfg.obo_audience)
+        if not token:
+            return None
+        from turnstone.core.providers import obo_auth_headers
+
+        return obo_auth_headers(cfg.provider, token)
 
     def _history_scope_user_id(self) -> str | None:
         """Identity that scopes conversation-history reads (recall tool,
@@ -15813,6 +15858,9 @@ class ChatSession:
                         or (self.reasoning_effort if same_lane else None),
                         mint=mint,
                         wire_id_map=wire_id_map,
+                        # Per-user OBO backend auth for the sub-agent lane (see
+                        # main loop); None for static aliases / userless turns.
+                        extra_headers=self._model_auth_headers(lane.alias),
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
                     # task-agent spend is visible in the dashboard, attributed

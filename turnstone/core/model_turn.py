@@ -636,6 +636,7 @@ def model_turn(
     wire_id_map: dict[str, str] | None = None,
     resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
     cancel_ref: list[Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
 
@@ -698,6 +699,12 @@ def model_turn(
     policy inside ``create_streaming`` and propagate unchanged).  An
     aborted *cancel_ref* suppresses retries — a deadline that closed the
     stream must not have the request resurrected behind its back.
+
+    *extra_headers* is forwarded verbatim to the provider's
+    ``create_streaming`` and overrides the SDK client's default headers for
+    the same key — the seam a per-user OBO ``auth_mode='entra_obo'`` backend
+    uses to inject its minted bearer as the credential header (``None`` leaves
+    the static client credential in place).
     """
     if mint is not None and wire_id_map is None:
         raise ValueError(
@@ -746,6 +753,7 @@ def model_turn(
             replay_reasoning_to_model=resolve_replay_reasoning_to_model(
                 lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
             ),
+            extra_headers=extra_headers,
             resolve_attachments=resolve_attachments,
         )
         try:

@@ -58,6 +58,7 @@ from turnstone.core.mcp_oauth import (
     get_obo_access_token_classified,
     get_user_access_token_classified,
     is_user_scoped_auth,
+    mint_obo_access_token,
 )
 
 if TYPE_CHECKING:
@@ -986,6 +987,39 @@ class MCPClientManager:
         deployments may leave it unset.
         """
         self._app_state = app_state
+
+    def mint_model_obo_token_sync(
+        self, *, user_id: str, audience: str, timeout: float = 20.0
+    ) -> str | None:
+        """Resolve a per-user model-provider OBO access token synchronously.
+
+        Bridges the sync agent/model loop to :func:`mint_obo_access_token` on
+        the mcp-loop (same thread that owns the token store's asyncio locks),
+        mirroring ``call_tool_sync``.  Returns ``None`` on any failure — no
+        credential, mint rejected, OAuth unwired, timeout — so the model call
+        falls back to the backend's static credential.
+        """
+        if not user_id or not audience:
+            return None
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return None
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                mint_obo_access_token(
+                    app_state=self._app_state, user_id=user_id, audience=audience
+                ),
+                loop,
+            )
+            return future.result(timeout=timeout)
+        except Exception:
+            log.debug(
+                "model obo token mint failed user=%s audience=%s",
+                user_id,
+                audience,
+                exc_info=True,
+            )
+            return None
 
     # -- lifecycle -----------------------------------------------------------
 

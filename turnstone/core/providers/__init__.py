@@ -37,6 +37,7 @@ __all__ = [
     "create_client",
     "create_provider",
     "drain_stream",
+    "obo_auth_headers",
     "list_known_models",
     "lookup_model_capabilities",
 ]
@@ -186,6 +187,20 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
         f"Unknown provider: {provider_name!r}. "
         "Supported: openai, anthropic, google, openai-compatible, anthropic-compatible, xai"
     )
+
+
+def obo_auth_headers(provider_name: str, token: str) -> dict[str, str]:
+    """Per-call request header(s) that carry *token* as the backend credential.
+
+    Anthropic surfaces authenticate with ``x-api-key``; OpenAI-style surfaces
+    (openai / openai-compatible / google / xai) use ``Authorization: Bearer``.
+    Passed as ``extra_headers`` to :meth:`LLMProvider.create_streaming`, it
+    overrides the static credential baked into the SDK client at construction —
+    the injection seam for a per-user OBO access token (``auth_mode='entra_obo'``).
+    """
+    if provider_name in ("anthropic", "anthropic-compatible"):
+        return {"x-api-key": token}
+    return {"authorization": f"Bearer {token}"}
 
 
 def lookup_model_capabilities(provider: str, model: str) -> dict[str, Any] | None:
