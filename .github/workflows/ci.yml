@@ -35,9 +35,11 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # Cap a hung run at 20 min instead of riding GitHub's 6-hour default
-    # (a flaky-hang run otherwise streams -v output for hours).
-    timeout-minutes: 20
+    # Cap a hung run at 30 min instead of riding GitHub's 6-hour default
+    # (a flaky-hang run otherwise streams -v output for hours).  Was 20;
+    # the suite's growth (~9.7k tests, coverage-instrumented, 3-version
+    # matrix) started brushing the old cap on healthy runs.
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
@@ -57,7 +59,7 @@ jobs:
       # -v lists each test id as it starts (pytest prints the nodeid at
       # logstart), so a hang names the culprit on the last line instead of
       # riding the job timeout with only a trail of "..." dots.
-      - run: pytest tests/ -m "not live" --cov=turnstone --cov-report=term-missing --cov-report=xml -v
+      - run: pytest tests/ -m "not live and not e2e_recovery" --cov=turnstone --cov-report=term-missing --cov-report=xml -v
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
@@ -66,7 +68,7 @@ jobs:
 
   test-postgres:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18
@@ -90,7 +92,7 @@ jobs:
         with:
           node-version: "24"
       - run: pip install -e ".[test]"
-      - run: pytest tests/ -m "not live" --storage-backend=postgresql -v
+      - run: pytest tests/ -m "not live and not e2e_recovery" --storage-backend=postgresql -v
         env:
           TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test
 

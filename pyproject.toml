@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnstone"
-version = "1.8.0a3"
+version = "1.8.0a4"
 description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
 license = "Apache-2.0"
@@ -103,6 +103,7 @@ testpaths = ["tests"]
 markers = [
     "live: requires a running LLM backend",
     "allow_thread_leak: test intentionally leaves a background thread running (opts out of the leaked-thread guard)",
+    "e2e_recovery: opt-in end-to-end SSE recovery harness (real server + real SSE consumers, scripted provider — NOT live, no LLM backend needed); tens of seconds each. CI lanes run ``-m 'not live and not e2e_recovery'``; select with ``-m e2e_recovery``.",
 ]
 filterwarnings = [
     # mcp v1 deprecates streamablehttp_client for an entry point whose call
