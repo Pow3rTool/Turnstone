@@ -11628,8 +11628,10 @@ _REASONING_EFFORT_CHOICES = frozenset(
 # Keep in sync with turnstone.core.providers._VALID_API_SURFACES.
 _API_SURFACE_CHOICES = frozenset({"chat", "responses"})
 # Per-model backend auth mode.  "static" = send the stored api_key; "entra_obo"
-# = mint a per-user Entra OBO token for obo_audience at call time.
-_MODEL_AUTH_MODES = frozenset({"static", "entra_obo"})
+# = mint a per-user Entra OBO token for obo_audience at call time; "entra_app"
+# = mint an app-identity (client-credentials) token from Turnstone's own SSO app
+# registration for obo_audience (no user; one shared machine identity).
+_MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app"})
 
 
 def _validate_api_surface(caps: Any) -> str | None:
@@ -12073,9 +12075,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if auth_mode not in _MODEL_AUTH_MODES:
         return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
     obo_audience = str(body.get("obo_audience", "")).strip()
-    if auth_mode == "entra_obo" and not obo_audience:
+    if auth_mode in ("entra_obo", "entra_app") and not obo_audience:
         return JSONResponse(
-            {"error": "obo_audience is required when auth_mode is 'entra_obo'"},
+            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
             status_code=400,
         )
 
@@ -12274,9 +12276,9 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     # a request that touches only one of the pair still checks against the other.
     eff_auth_mode = updates.get("auth_mode", existing.get("auth_mode", "static"))
     eff_audience = updates.get("obo_audience", existing.get("obo_audience", ""))
-    if eff_auth_mode == "entra_obo" and not eff_audience:
+    if eff_auth_mode in ("entra_obo", "entra_app") and not eff_audience:
         return JSONResponse(
-            {"error": "obo_audience is required when auth_mode is 'entra_obo'"},
+            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
             status_code=400,
         )
 

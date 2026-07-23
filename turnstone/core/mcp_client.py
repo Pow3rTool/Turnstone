@@ -58,6 +58,7 @@ from turnstone.core.mcp_oauth import (
     get_obo_access_token_classified,
     get_user_access_token_classified,
     is_user_scoped_auth,
+    mint_app_access_token,
     mint_obo_access_token,
 )
 
@@ -1019,6 +1020,29 @@ class MCPClientManager:
                 audience,
                 exc_info=True,
             )
+            return None
+
+    def mint_app_token_sync(self, *, audience: str, timeout: float = 20.0) -> str | None:
+        """Resolve an app-identity (client-credentials) model token synchronously.
+
+        The ``auth_mode='entra_app'`` sibling of ``mint_model_obo_token_sync``:
+        bridges to :func:`mint_app_access_token` on the mcp-loop. No user needed
+        — Turnstone's own SSO app registration is the identity. Returns ``None``
+        on any failure so the model call falls back to the static credential.
+        """
+        if not audience:
+            return None
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return None
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                mint_app_access_token(app_state=self._app_state, audience=audience),
+                loop,
+            )
+            return future.result(timeout=timeout)
+        except Exception:
+            log.debug("model app token mint failed audience=%s", audience, exc_info=True)
             return None
 
     # -- lifecycle -----------------------------------------------------------

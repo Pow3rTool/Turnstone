@@ -10,11 +10,13 @@ gateway with a per-user Entra On-Behalf-Of access token instead of one static
 * :func:`mint_obo_access_token` — the model-provider mint (reuses the MCP OBO
   grant legs + rotation write-back, but with an in-process token cache and no
   per-server machinery);
-* :func:`obo_auth_headers` — provider→credential-header mapping;
 * ``ModelRegistry.get_client`` constructing an OBO backend that has no static
   fallback key;
-* ``ChatSession._model_auth_headers`` — the per-call resolve at the model call
-  site (static alias / no user / failed mint all fall back to the static key).
+* ``ChatSession._model_obo_token`` — the per-call token resolve at the model
+  call site (static alias / no user / failed mint all fall back to the static
+  key). The token is bound via ``client.with_options(api_key=...)`` at the call
+  site (not injected as a header — the Anthropic SDK ignores an ``extra_headers``
+  ``x-api-key`` override).
 """
 
 from __future__ import annotations
@@ -33,10 +35,9 @@ from alembic.config import Config
 
 from tests.conftest import make_mcp_token_cipher
 from turnstone.core.mcp_crypto import MCPTokenStore
-from turnstone.core.mcp_oauth import mint_obo_access_token
+from turnstone.core.mcp_oauth import mint_app_access_token, mint_obo_access_token
 from turnstone.core.model_registry import ModelConfig, ModelRegistry, load_model_registry
 from turnstone.core.oidc import OIDCConfig
-from turnstone.core.providers import obo_auth_headers
 from turnstone.core.session import ChatSession
 from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -163,9 +164,7 @@ class TestModelDefinitionStorage:
 
     def test_update_toggles_auth_mode(self, storage: SQLiteBackend) -> None:
         storage.create_model_definition(definition_id="d3", alias="m3", model="gpt-5")
-        assert storage.update_model_definition(
-            "d3", auth_mode="entra_obo", obo_audience=AUDIENCE
-        )
+        assert storage.update_model_definition("d3", auth_mode="entra_obo", obo_audience=AUDIENCE)
         row = storage.get_model_definition("d3")
         assert row is not None
         assert row["auth_mode"] == "entra_obo" and row["obo_audience"] == AUDIENCE
@@ -184,24 +183,6 @@ class TestModelDefinitionStorage:
         cfg = registry.get_config("tf")
         assert cfg.auth_mode == "entra_obo"
         assert cfg.obo_audience == AUDIENCE
-
-
-# ---------------------------------------------------------------------------
-# obo_auth_headers — provider → credential header
-# ---------------------------------------------------------------------------
-
-
-class TestOboAuthHeaders:
-    def test_anthropic_uses_x_api_key(self) -> None:
-        assert obo_auth_headers("anthropic", "TOK") == {"x-api-key": "TOK"}
-        assert obo_auth_headers("anthropic-compatible", "TOK") == {"x-api-key": "TOK"}
-
-    def test_openai_style_uses_bearer(self) -> None:
-        # Capital "Authorization" — must match the OpenAI SDK's own default-auth
-        # header key, else the SDK emits two Authorization headers (dup 400 /
-        # stale client key wins) instead of the override replacing it.
-        for prov in ("openai", "openai-compatible", "google", "xai"):
-            assert obo_auth_headers(prov, "TOK") == {"Authorization": "Bearer TOK"}
 
 
 # ---------------------------------------------------------------------------
@@ -455,16 +436,103 @@ class TestMintOboAccessToken:
 
 
 # ---------------------------------------------------------------------------
-# ChatSession._model_auth_headers — resolve at the model call site
+# mint_app_access_token — app-identity (client-credentials) mint
+# ---------------------------------------------------------------------------
+
+
+def _mint_app(state: SimpleNamespace, **kwargs: Any) -> Any:
+    async def _run() -> Any:
+        return await mint_app_access_token(app_state=state, audience=AUDIENCE, **kwargs)
+
+    return asyncio.run(_run())
+
+
+class TestMintAppAccessToken:
+    def test_happy_path_client_credentials_and_caches(self, storage: SQLiteBackend) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "app-at", "expires_in": 3600})
+        )
+        # NOTE: no captured user credential seeded — app identity needs none.
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+
+        assert _mint_app(state) == "app-at"
+        # Exact client-credentials wire shape — scope pins <audience>/.default.
+        assert client.post.call_count == 1
+        call = client.post.call_args
+        assert call.args == (TOKEN_ENDPOINT,)
+        assert call.kwargs["data"] == {
+            "grant_type": "client_credentials",
+            "client_id": "cid",
+            "client_secret": "csecret",
+            "scope": f"{AUDIENCE}/.default",
+        }
+        # Cached in the DB under the synthetic __app__ user — second call, no IdP.
+        assert _mint_app(state) == "app-at"
+        assert client.post.call_count == 1
+        cache_server = f"__model_app__:{AUDIENCE}"
+        raw = storage.get_mcp_user_token("__app__", cache_server)
+        assert raw is not None and raw["refresh_token_ct"] is None
+
+    def test_works_with_zero_user_credentials(self, storage: SQLiteBackend) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(200, {"access_token": "app-at", "expires_in": 3600})
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        # The credential store is empty; the app grant still succeeds.
+        assert state.mcp_token_store.get_oidc_credential(USER, ISSUER) is None
+        assert _mint_app(state) == "app-at"
+
+    def test_oidc_disabled_returns_none_no_http(self, storage: SQLiteBackend) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock()
+        state = _make_app_state(
+            storage, http_client=client, oidc_config=_make_oidc_config(enabled=False)
+        )
+        assert _mint_app(state) is None
+        assert client.post.call_count == 0
+
+    def test_rejected_grant_returns_none(self, storage: SQLiteBackend) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            return_value=_mk_response(
+                400, {"error": "invalid_client", "error_description": "AADSTS7000215"}
+            )
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        assert _mint_app(state) is None
+
+    def test_force_refresh_bypasses_cache(self, storage: SQLiteBackend) -> None:
+        client = MagicMock(spec=httpx.AsyncClient)
+        client.post = AsyncMock(
+            side_effect=[
+                _mk_response(200, {"access_token": "app-1", "expires_in": 3600}),
+                _mk_response(200, {"access_token": "app-2", "expires_in": 3600}),
+            ]
+        )
+        state = _make_app_state(storage, http_client=client, oidc_config=_make_oidc_config())
+        assert _mint_app(state) == "app-1"
+        assert _mint_app(state, force_refresh=True) == "app-2"
+        assert client.post.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# ChatSession._model_obo_token — resolve at the model call site
 # ---------------------------------------------------------------------------
 
 
 def _fake_session(
-    *, registry: ModelRegistry | None, user_id: str | None, mint_token: str | None
+    *,
+    registry: ModelRegistry | None,
+    user_id: str | None,
+    mint_token: str | None,
+    app_token: str | None = None,
 ) -> SimpleNamespace:
-    """Minimal stand-in exposing exactly what ``_model_auth_headers`` reads."""
+    """Minimal stand-in exposing exactly what ``_model_obo_token`` reads."""
     mcp = SimpleNamespace(
         mint_model_obo_token_sync=MagicMock(return_value=mint_token),
+        mint_app_token_sync=MagicMock(return_value=app_token),
     )
     return SimpleNamespace(
         _registry=registry,
@@ -477,7 +545,7 @@ def _registry_with(cfg: ModelConfig) -> ModelRegistry:
     return ModelRegistry(models={cfg.alias: cfg}, default=cfg.alias)
 
 
-class TestModelAuthHeaders:
+class TestModelOboToken:
     def _obo_cfg(self, provider: str = "anthropic") -> ModelConfig:
         return ModelConfig(
             alias="tf",
@@ -489,27 +557,30 @@ class TestModelAuthHeaders:
             obo_audience=AUDIENCE,
         )
 
-    def test_obo_alias_with_user_returns_minted_header(self) -> None:
+    def test_obo_alias_with_user_returns_token(self) -> None:
         reg = _registry_with(self._obo_cfg())
         sess = _fake_session(registry=reg, user_id=USER, mint_token="minted-jwt")
-        headers = ChatSession._model_auth_headers(sess, "tf")
-        assert headers == {"x-api-key": "minted-jwt"}
+        assert ChatSession._model_obo_token(sess, "tf") == "minted-jwt"
         sess._mcp_client.mint_model_obo_token_sync.assert_called_once_with(
             user_id=USER, audience=AUDIENCE
         )
 
-    def test_openai_surface_obo_uses_bearer(self) -> None:
-        reg = _registry_with(self._obo_cfg(provider="openai-compatible"))
-        sess = _fake_session(registry=reg, user_id=USER, mint_token="minted-jwt")
-        headers = ChatSession._model_auth_headers(sess, "tf")
-        assert headers == {"Authorization": "Bearer minted-jwt"}
+    def test_token_is_provider_agnostic(self) -> None:
+        # The raw token is returned regardless of provider surface — the caller
+        # binds it via ``with_options(api_key=...)``, so there is no per-provider
+        # header shaping here. (The old header-injection path returned x-api-key
+        # for anthropic, which the SDK silently ignored → the prod 401.)
+        for provider in ("anthropic", "openai-compatible"):
+            reg = _registry_with(self._obo_cfg(provider=provider))
+            sess = _fake_session(registry=reg, user_id=USER, mint_token="minted-jwt")
+            assert ChatSession._model_obo_token(sess, "tf") == "minted-jwt"
 
     def test_primary_stream_forwards_alias_for_obo(self) -> None:
         # Regression: the primary _create_stream_with_retry call must pass
-        # model_alias, or _model_auth_headers("") can't resolve the OBO override
-        # and an entra_obo main turn goes out on the static client key. The
-        # fallback path and utility (title) completions always passed the alias;
-        # the primary path silently didn't.
+        # model_alias, or _model_obo_token("") can't resolve the OBO token and an
+        # entra_obo main turn goes out on the static client key. The fallback
+        # path and utility (title) completions always passed the alias; the
+        # primary path silently didn't.
         sess = MagicMock()
         sess._model_alias = "oboagent"
         ChatSession._create_stream_with_retry(sess, [{"role": "user", "content": "hi"}])
@@ -526,13 +597,13 @@ class TestModelAuthHeaders:
         )
         reg = _registry_with(static_cfg)
         sess = _fake_session(registry=reg, user_id=USER, mint_token="unused")
-        assert ChatSession._model_auth_headers(sess, "plain") is None
+        assert ChatSession._model_obo_token(sess, "plain") is None
         sess._mcp_client.mint_model_obo_token_sync.assert_not_called()
 
     def test_no_user_context_returns_none_and_never_mints(self) -> None:
         reg = _registry_with(self._obo_cfg())
         sess = _fake_session(registry=reg, user_id="", mint_token="unused")
-        assert ChatSession._model_auth_headers(sess, "tf") is None
+        assert ChatSession._model_obo_token(sess, "tf") is None
         sess._mcp_client.mint_model_obo_token_sync.assert_not_called()
 
     def test_failed_mint_falls_back_to_static(self) -> None:
@@ -540,9 +611,44 @@ class TestModelAuthHeaders:
         sess = _fake_session(registry=reg, user_id=USER, mint_token=None)
         # Mint returned None (no credential / rejected) → None so the static
         # client credential stands.
-        assert ChatSession._model_auth_headers(sess, "tf") is None
+        assert ChatSession._model_obo_token(sess, "tf") is None
 
     def test_unknown_alias_returns_none(self) -> None:
         reg = _registry_with(self._obo_cfg())
         sess = _fake_session(registry=reg, user_id=USER, mint_token="x")
-        assert ChatSession._model_auth_headers(sess, "does-not-exist") is None
+        assert ChatSession._model_obo_token(sess, "does-not-exist") is None
+
+    # -- entra_app (app-identity / client-credentials) --------------------------
+
+    def _app_cfg(self) -> ModelConfig:
+        return ModelConfig(
+            alias="tf",
+            base_url="https://gateway.example.com",
+            api_key="static-fallback",
+            model="vmg/opus",
+            provider="anthropic",
+            auth_mode="entra_app",
+            obo_audience=AUDIENCE,
+        )
+
+    def test_app_alias_mints_without_user(self) -> None:
+        # entra_app needs NO user context — the app identity is used even for
+        # userless turns (utility / coordinator / service / CLI).
+        reg = _registry_with(self._app_cfg())
+        sess = _fake_session(registry=reg, user_id="", mint_token=None, app_token="app-jwt")
+        assert ChatSession._model_obo_token(sess, "tf") == "app-jwt"
+        sess._mcp_client.mint_app_token_sync.assert_called_once_with(audience=AUDIENCE)
+        sess._mcp_client.mint_model_obo_token_sync.assert_not_called()
+
+    def test_app_alias_uses_app_identity_even_with_user(self) -> None:
+        # A user is present, but entra_app deliberately uses the app identity,
+        # not per-user OBO.
+        reg = _registry_with(self._app_cfg())
+        sess = _fake_session(registry=reg, user_id=USER, mint_token="obo-jwt", app_token="app-jwt")
+        assert ChatSession._model_obo_token(sess, "tf") == "app-jwt"
+        sess._mcp_client.mint_model_obo_token_sync.assert_not_called()
+
+    def test_app_failed_mint_falls_back_to_static(self) -> None:
+        reg = _registry_with(self._app_cfg())
+        sess = _fake_session(registry=reg, user_id="", mint_token=None, app_token=None)
+        assert ChatSession._model_obo_token(sess, "tf") is None

@@ -154,14 +154,14 @@ class ModelRegistry:
                 raise ValueError(f"Unknown model alias: {alias}")
             if alias not in self._clients:
                 cfg = self._models[alias]
-                # An entra_obo backend authenticates per-call via a minted
-                # bearer injected as an ``extra_headers`` override, so the
-                # cached client only needs to CONSTRUCT — feed a placeholder
-                # when no static fallback key is set (the SDKs reject an empty
-                # key that also has no env fallback).  The real credential
-                # never rides on this client object.
+                # An entra_obo / entra_app backend authenticates per-call via a
+                # minted token bound with ``client.with_options(api_key=...)``, so
+                # the cached client only needs to CONSTRUCT — feed a placeholder
+                # when no static fallback key is set (the SDKs reject an empty key
+                # that also has no env fallback).  The real credential is supplied
+                # per call and never rides on this base client object.
                 client_key = cfg.api_key
-                if not client_key and cfg.auth_mode == "entra_obo":
+                if not client_key and cfg.auth_mode in ("entra_obo", "entra_app"):
                     client_key = "obo-placeholder-unused"
                 try:
                     self._clients[alias] = create_client(

@@ -7135,8 +7135,10 @@ function _renderModels(items) {
     // operator opt-in). Default values are silent.
     if (m.surface_persisted_reasoning === false) overrides.push("surface=off");
     if (m.replay_reasoning_to_model === true) overrides.push("replay=on");
-    // Per-user OBO backend auth surfaces as a hint (static is the default).
+    // Per-user OBO / app-identity backend auth surfaces as a hint (static is
+    // the default).
     if (m.auth_mode === "entra_obo") overrides.push("obo");
+    else if (m.auth_mode === "entra_app") overrides.push("app");
     if (overrides.length) {
       const ovrSpan = document.createElement("span");
       ovrSpan.className = "model-overrides-hint";
@@ -7695,14 +7697,20 @@ function submitCreateModel() {
   ).checked;
 
   // Backend auth: entra_obo mints a per-user OBO token for obo_audience at
-  // call time (the server re-validates the same pairing).
+  // call time; entra_app mints an app-identity (client-credentials) token from
+  // Turnstone's SSO app reg. (The server re-validates the same pairing.)
   const authMode =
     document.getElementById("model-auth-mode").value || "static";
   const oboAudience = document
     .getElementById("model-obo-audience")
     .value.trim();
-  if (authMode === "entra_obo" && oboAudience === "") {
-    _showModelError("OBO audience is required when auth mode is 'entra_obo'");
+  if (
+    (authMode === "entra_obo" || authMode === "entra_app") &&
+    oboAudience === ""
+  ) {
+    _showModelError(
+      "OBO audience is required when auth mode is 'entra_obo' or 'entra_app'",
+    );
     return;
   }
   form.auth_mode = authMode;

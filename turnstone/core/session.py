@@ -5154,7 +5154,7 @@ class ChatSession:
             # Per-user OBO backend auth (see main loop) — utility completions on
             # an entra_obo alias mint under the same driver; static aliases and
             # userless internal calls resolve None and keep the static key.
-            extra_headers=self._model_auth_headers(lane.alias),
+            obo_api_key=self._model_obo_token(lane.alias),
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -5376,9 +5376,7 @@ class ChatSession:
         tracker = self._get_health_tracker()
 
         try:
-            result = self._try_stream(
-                self.client, self.model, msgs, model_alias=self._model_alias
-            )
+            result = self._try_stream(self.client, self.model, msgs, model_alias=self._model_alias)
             if tracker:
                 tracker.record_success()
             return result
@@ -5489,6 +5487,14 @@ class ChatSession:
             role_counts,
         )
         msgs = self._maybe_attach_vllm_chat_reasoning(msgs, prov, model_alias)
+        # Per-user OBO backend auth: bind the minted token as the SDK client's
+        # api_key (with_options reuses the connection pool) so it becomes the
+        # provider's own credential header — extra_headers can't override the
+        # Anthropic SDK's x-api-key. None → the backend's static key stands.
+        # Resolved once, outside the retry loop.
+        obo_key = self._model_obo_token(model_alias or "")
+        if obo_key:
+            client = client.with_options(api_key=obo_key)
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
@@ -5519,10 +5525,6 @@ class ChatSession:
                     replay_reasoning_to_model=self._resolve_replay_reasoning_to_model(
                         model_alias, caps=resolved_caps
                     ),
-                    # Per-user OBO backend auth: override the static client
-                    # credential with a minted bearer for this turn's driver
-                    # (None for static aliases / no user → static key stands).
-                    extra_headers=self._model_auth_headers(model_alias or ""),
                     resolve_attachments=lambda ids: self._resolve_attachments(ids, resolved_caps),
                 )
             except Exception as e:
@@ -5977,15 +5979,16 @@ class ChatSession:
         """
         return self._acting_user_id or self._mcp_user_id
 
-    def _model_auth_headers(self, alias: str) -> dict[str, str] | None:
-        """Per-call credential-header override for an OBO-enabled model backend.
+    def _model_obo_token(self, alias: str) -> str | None:
+        """Resolve the per-user OBO access token for an OBO-enabled backend.
 
         When *alias*'s ModelConfig has ``auth_mode == "entra_obo"`` and a user
         is driving the turn, mint a per-user Entra OBO access token for the
-        model's ``obo_audience`` and return it as the provider's credential
-        header (``x-api-key`` for Anthropic surfaces, ``Authorization: Bearer``
-        for OpenAI-style), for passing as ``create_streaming(extra_headers=...)``
-        — which overrides the static credential baked into the SDK client.
+        model's ``obo_audience`` and return it.  The caller binds it as the SDK
+        client's ``api_key`` (via ``with_options``, which reuses the connection
+        pool) so the SDK emits it as its own credential header — deliberately
+        NOT an injected ``extra_headers`` value, which the Anthropic SDK will
+        not let override its ``x-api-key``.
 
         Returns ``None`` (leave the static key in place) for static aliases, an
         empty/unknown alias, missing user context (CLI / eval / coordinator /
@@ -6004,8 +6007,25 @@ class ChatSession:
             cfg = registry.get_config(alias)
         except ValueError:
             return None
-        if getattr(cfg, "auth_mode", "static") != "entra_obo" or not cfg.obo_audience:
+        mode = getattr(cfg, "auth_mode", "static")
+        if mode not in ("entra_obo", "entra_app") or not cfg.obo_audience:
             return None
+        if mode == "entra_app":
+            # App/managed identity via client-credentials — Turnstone's own SSO
+            # app reg, no user needed, so this also covers utility / coordinator
+            # / service / CLI turns. The gateway resolves it to one shared
+            # virtual account (no per-user attribution).
+            token = mcp.mint_app_token_sync(audience=cfg.obo_audience)
+            if not token:
+                log.warning(
+                    "model_app.fallback_to_static",
+                    alias=alias,
+                    audience=cfg.obo_audience,
+                    has_static_key=bool(getattr(cfg, "api_key", "")),
+                )
+                return None
+            return token
+        # entra_obo — per-user On-Behalf-Of.
         user_id = (self._mcp_effective_user_id or "").strip()
         if not user_id:
             # Expected for utility / CLI / eval / coordinator / service turns —
@@ -6027,9 +6047,7 @@ class ChatSession:
                 has_static_key=bool(getattr(cfg, "api_key", "")),
             )
             return None
-        from turnstone.core.providers import obo_auth_headers
-
-        return obo_auth_headers(cfg.provider, token)
+        return token
 
     def _history_scope_user_id(self) -> str | None:
         """Identity that scopes conversation-history reads (recall tool,
@@ -16110,7 +16128,7 @@ class ChatSession:
                         wire_id_map=wire_id_map,
                         # Per-user OBO backend auth for the sub-agent lane (see
                         # main loop); None for static aliases / userless turns.
-                        extra_headers=self._model_auth_headers(lane.alias),
+                        obo_api_key=self._model_obo_token(lane.alias),
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
                     # task-agent spend is visible in the dashboard, attributed

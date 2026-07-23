@@ -2827,16 +2827,12 @@ async def mint_obo_access_token(
                     persist_rotation=_persist_rotation,
                 )
         except MCPOAuthRefreshFailed:
-            log.warning(
-                "model_obo.mint_failed", user_id=user_id, audience=audience, exc_info=True
-            )
+            log.warning("model_obo.mint_failed", user_id=user_id, audience=audience, exc_info=True)
             return None
 
         access_token = tokens.get("access_token")
         if not isinstance(access_token, str) or not access_token:
-            log.warning(
-                "model_obo.mint_missing_access_token", user_id=user_id, audience=audience
-            )
+            log.warning("model_obo.mint_missing_access_token", user_id=user_id, audience=audience)
             return None
         try:
             await _persist_obo_cache_row(
@@ -2866,6 +2862,139 @@ async def mint_obo_access_token(
             audience=audience,
             cache_server=cache_server,
         )
+        return access_token
+
+
+# ---------------------------------------------------------------------------
+# App-identity (client-credentials) model token — Turnstone's own SSO app reg
+# ---------------------------------------------------------------------------
+# The ``auth_mode='entra_app'`` sibling of the OBO path: instead of a per-user
+# On-Behalf-Of token it mints an APP token from the ``[oidc]`` client id + secret
+# via the client-credentials grant. No user, no captured refresh token, no
+# rotation — one token per audience, shared by everyone, so a gateway resolves it
+# to a single machine (virtual-account) identity with no per-user attribution. It
+# reuses the same DB mint-cache under a synthetic ``__app__`` user.
+
+_APP_CACHE_USER = "__app__"
+
+
+def _model_app_cache_server(audience: str) -> str:
+    """Synthetic ``mcp_user_tokens`` key for an app-credential mint-cache row.
+
+    App tokens carry no user, so they cache once per audience under the shared
+    ``__app__`` pseudo-user; the ``__model_app__:`` prefix keeps them distinct
+    from per-user OBO rows (``__model_obo__:``) and real oauth_user server rows.
+    """
+    return f"__model_app__:{audience}"
+
+
+async def mint_app_access_token(
+    *,
+    app_state: Any,
+    audience: str,
+    force_refresh: bool = False,
+) -> str | None:
+    """App-identity Entra access token for *audience* via client-credentials.
+
+    Uses Turnstone's own SSO app registration (``[oidc]`` ``client_id`` +
+    ``client_secret``) — no user, no captured refresh token, no rotation. One
+    token per audience, shared by every caller and cached in an
+    ``mcp_user_tokens`` row under the synthetic ``__app__`` user until shortly
+    before expiry. This is the ``auth_mode='entra_app'`` backend entry point —
+    the "we already have SSO, let the app call the gateway as its own managed
+    identity" path (a gateway resolves it to one virtual account, no per-user
+    attribution). Because it needs no user context it also serves utility /
+    coordinator / service / CLI turns that OBO cannot. Returns ``None`` — the
+    signal to fall back to the static credential — when OIDC is
+    disabled/unconfigured, the app has no secret, or the grant is rejected.
+    """
+    if not audience:
+        return None
+    oidc_config = getattr(app_state, "oidc_config", None)
+    if oidc_config is None or not getattr(oidc_config, "enabled", False):
+        return None
+    client_id = str(getattr(oidc_config, "client_id", "") or "")
+    client_secret = str(getattr(oidc_config, "client_secret", "") or "")
+    token_endpoint = str(getattr(oidc_config, "token_endpoint", "") or "")
+    if not (client_id and client_secret and token_endpoint):
+        return None
+    token_store: MCPTokenStore | None = getattr(app_state, "mcp_token_store", None)
+    storage = _get_storage(app_state)
+    if token_store is None or storage is None:
+        return None
+    issuer = str(getattr(oidc_config, "issuer", "") or "")
+
+    cache_server = _model_app_cache_server(audience)
+    if not force_refresh:
+        try:
+            plain = await asyncio.to_thread(
+                token_store.get_user_token, _APP_CACHE_USER, cache_server
+            )
+        except MCPTokenDecryptError:
+            plain = None
+        if _is_fresh_obo_cache_row(plain, audience, "") and plain is not None:
+            return plain["access_token"]
+
+    # Single-flight the mint. No per-user credential to rotate, so only the
+    # per-audience local + cluster lock is taken (no credential lock).
+    lock = _refresh_lock_for(app_state, _APP_CACHE_USER, cache_server)
+    pg_lock = await _acquire_pg_refresh_lock(storage, _APP_CACHE_USER, cache_server)
+    async with lock, pg_lock:
+        if not force_refresh:
+            try:
+                plain = await asyncio.to_thread(
+                    token_store.get_user_token, _APP_CACHE_USER, cache_server
+                )
+            except MCPTokenDecryptError:
+                plain = None
+            if _is_fresh_obo_cache_row(plain, audience, "") and plain is not None:
+                return plain["access_token"]
+
+        injected_client: httpx.AsyncClient | None = getattr(app_state, "obo_http_client", None)
+        try:
+            async with contextlib.AsyncExitStack() as mint_stack:
+                mint_client: httpx.AsyncClient
+                if injected_client is not None:
+                    mint_client = injected_client
+                else:
+                    mint_client = await mint_stack.enter_async_context(
+                        httpx.AsyncClient(timeout=_DEFAULT_HTTP_TIMEOUT)
+                    )
+                tokens = await _obo_token_post(
+                    token_endpoint=token_endpoint,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "scope": f"{audience}/.default",
+                    },
+                    http_client=mint_client,
+                    leg="client-credentials",
+                )
+        except MCPOAuthRefreshFailed:
+            log.warning("model_app.mint_failed", audience=audience, exc_info=True)
+            return None
+
+        access_token = tokens.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            log.warning("model_app.mint_missing_access_token", audience=audience)
+            return None
+        try:
+            await _persist_obo_cache_row(
+                token_store,
+                _APP_CACHE_USER,
+                cache_server,
+                access_token=access_token,
+                expires_at=_expires_at_from_response(
+                    tokens, default_ttl_seconds=_OBO_DEFAULT_TTL_SECONDS
+                ),
+                scopes="",
+                issuer=issuer,
+                audience=audience,
+            )
+        except Exception:
+            log.warning("model_app.cache_persist_failed", audience=audience, exc_info=True)
+        log.info("model_app.minted", audience=audience, cache_server=cache_server)
         return access_token
 
 
