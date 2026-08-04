@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+    from turnstone.core.attribution import ExcursionAttribution
+
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -2767,6 +2769,18 @@ async def _interactive_create_post_install(
         def _run_initial() -> None:
             me = threading.current_thread()
             try:
+                # A coordinator-spawned child was constructed with signed,
+                # inherited excursion attribution; preserve it.  A direct
+                # human create has no inherited context, so its initial
+                # message starts an ordinary root excursion here.
+                if getattr(session, "_excursion_attribution", None) is None:
+                    begin = getattr(session, "begin_excursion", None)
+                    if uid and callable(begin):
+                        begin(
+                            uid,
+                            cause_action_id=send_id,
+                            cause_workstream_id=ws.id,
+                        )
                 session.send(
                     initial_message,
                     attachments=resolved_atts or None,
@@ -5629,6 +5643,8 @@ def main() -> None:
         parent_ws_id: str | None = None,
         project_id: str = "",
         persona_snapshot: PersonaSnapshot | None = None,
+        excursion_attribution: ExcursionAttribution | None = None,
+        excursion_conflicting_principals: frozenset[str] | None = None,
     ) -> ChatSession:
         assert ui is not None
         # Resolve the effective alias once and use it consistently
@@ -5734,6 +5750,8 @@ def main() -> None:
             parent_ws_id=parent_ws_id,
             project_id=project_id,
             persona_snapshot=persona_snapshot,
+            excursion_attribution=excursion_attribution,
+            excursion_conflicting_principals=excursion_conflicting_principals,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

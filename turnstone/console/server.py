@@ -317,6 +317,27 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
             coord_ws_id = auth_result.extra_claims.get("coord_ws_id")
             if coord_ws_id:
                 extra["coord_ws_id"] = coord_ws_id
+            # These values arrived inside a validated coordinator JWT.
+            # Preserve them across the console→node re-mint; never copy
+            # similarly named request-body fields into this control plane.
+            from turnstone.core.attribution import (
+                CLAIM_CAUSE_ACTION_KEY,
+                CLAIM_CAUSE_WORKSTREAM_KEY,
+                CLAIM_EXCURSION_KEY,
+                CLAIM_PRINCIPAL_KEY,
+                CLAIM_VERSION_KEY,
+            )
+
+            for claim_key in (
+                CLAIM_VERSION_KEY,
+                CLAIM_PRINCIPAL_KEY,
+                CLAIM_EXCURSION_KEY,
+                CLAIM_CAUSE_ACTION_KEY,
+                CLAIM_CAUSE_WORKSTREAM_KEY,
+            ):
+                claim_value = auth_result.extra_claims.get(claim_key)
+                if claim_value:
+                    extra[claim_key] = claim_value
         token = create_jwt(
             user_id=auth_result.user_id,
             scopes=auth_result.scopes,
@@ -4795,6 +4816,7 @@ def _bootstrap_coord_subsystem(
             console_base_url=console_bind_url,
             storage=storage,
             token_factory=_token_factory,
+            attribution_token_factory=tm.token_for,
             coord_ws_id=ws_id,
             user_id=user_id,
             child_event_bus=coord_adapter.child_event_bus,

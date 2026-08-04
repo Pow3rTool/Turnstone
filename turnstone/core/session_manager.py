@@ -16,6 +16,10 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
+from turnstone.core.attribution import (
+    ExcursionAttribution,
+    conflicting_principals_from_config,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.personas import snapshot_from_config
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
@@ -683,6 +687,12 @@ class SessionManager:
                     extra_build_kwargs: dict[str, Any] = {}
                     if persona_snapshot is not None:
                         extra_build_kwargs["persona_snapshot"] = persona_snapshot
+                    excursion_attribution = ExcursionAttribution.from_config(saved_cfg or {})
+                    excursion_conflicts = conflicting_principals_from_config(saved_cfg or {})
+                    if excursion_attribution is not None:
+                        extra_build_kwargs["excursion_attribution"] = excursion_attribution
+                    if excursion_conflicts:
+                        extra_build_kwargs["excursion_conflicting_principals"] = excursion_conflicts
                     ws.session = self._adapter.build_session(
                         ws, model=saved_alias, **extra_build_kwargs
                     )

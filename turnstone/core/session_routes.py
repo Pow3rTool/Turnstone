@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from starlette.routing import BaseRoute
 
     from turnstone.core.attachments import UploadRejection
+    from turnstone.core.attribution import ExcursionAttribution
     from turnstone.core.session import ChatSession
     from turnstone.core.session_manager import SessionManager
     from turnstone.core.session_ui_base import SessionUIBase
@@ -2814,6 +2815,15 @@ def make_create_handler(
             kwargs = cfg.create_build_kwargs(
                 request, body, uid, skill_data, skill_id_resolved, applied_skill_version
             )
+            # Delegated execution identity is accepted only from validated,
+            # signed coordinator claims.  The body still controls tenancy
+            # metadata (under its existing service-only override gate), never
+            # the trusted principal whose OBO token the child may use.
+            from turnstone.core.attribution import attribution_from_auth
+
+            inherited_attribution = attribution_from_auth(auth)
+            if inherited_attribution is not None:
+                kwargs["excursion_attribution"] = inherited_attribution
             if persona_snapshot is not None:
                 # ``persona`` is SessionManager.create's explicit param
                 # (Workstream attr + workstreams row); the snapshot rides
@@ -4256,6 +4266,7 @@ def _make_dispatch_attempt(
     ordered_taken: list[str],
     send_id: str,
     acting_uid: str,
+    excursion_attribution: ExcursionAttribution | None = None,
     defer_fidelity: bool = False,
 ) -> Callable[[ChatSession], tuple[bool, dict[str, Any]]]:
     """Build one atomic queue-or-spawn attempt bound to ONE session capture.
@@ -4323,7 +4334,9 @@ def _make_dispatch_attempt(
                     message,
                     attachment_ids=list(ordered_taken),
                     queue_msg_id=send_id or None,
-                    interjector_user_id=acting_uid,
+                    interjector_user_id=(
+                        getattr(excursion_attribution, "principal_id", "") or acting_uid
+                    ),
                 )
             except AttachmentsNotQueueableError:
                 queue_outcome["rejected"] = "attachments_busy"
@@ -4353,9 +4366,18 @@ def _make_dispatch_attempt(
                 # kwarg) so per-kind session stubs with explicit send
                 # signatures keep working; getattr-guarded for the same
                 # reason. The queue path above never rebinds.
-                bind = getattr(session, "bind_acting_user", None)
-                if acting_uid and callable(bind):
-                    bind(acting_uid)
+                begin = getattr(session, "begin_excursion", None)
+                if callable(begin) and (acting_uid or excursion_attribution is not None):
+                    begin(
+                        acting_uid,
+                        inherited=excursion_attribution,
+                        cause_action_id=send_id,
+                        cause_workstream_id=ws.id,
+                    )
+                else:
+                    bind = getattr(session, "bind_acting_user", None)
+                    if acting_uid and callable(bind):
+                        bind(acting_uid)
                 session.send(message, **kwargs)
             except GenerationCancelled:
                 # Safety net — send() normally handles this internally.
@@ -4712,6 +4734,17 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
         # turn under the initiator's identity (no mid-turn credential
         # switch); the next fresh turn rebinds.
         acting_uid = auth_user_id(request)
+        from turnstone.core.attribution import attribution_from_auth
+
+        try:
+            excursion_attribution = attribution_from_auth(
+                getattr(getattr(request, "state", None), "auth_result", None)
+            )
+        except ValueError:
+            return JSONResponse(
+                {"error": "invalid coordinator excursion attribution"},
+                status_code=401,
+            )
 
         # ----- Attachment resolution (from the per-node upload buffer) -----
         send_id = ""
@@ -4854,6 +4887,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
                         ordered_taken=ordered_taken,
                         send_id=pending_msg_id,
                         acting_uid=acting_uid,
+                        excursion_attribution=excursion_attribution,
                         defer_fidelity=True,
                     ),
                 )
@@ -4950,6 +4984,7 @@ def make_send_handler(cfg: SessionEndpointConfig) -> Handler:
             ordered_taken=ordered_taken,
             send_id=send_id,
             acting_uid=acting_uid,
+            excursion_attribution=excursion_attribution,
         )
         session_now = ws.session
         if session_now is None:

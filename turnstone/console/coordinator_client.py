@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 
+from turnstone.core.attribution import ExcursionAttribution
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
 from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
@@ -445,9 +446,13 @@ class CoordinatorTokenManager:
         self._margin = ttl_seconds * refresh_margin
         self._token: str = ""
         self._expires_at: float = 0.0
+        self._attribution_key: tuple[str, str, str, str] | None = None
         self._lock = threading.Lock()
 
-    def _mint(self) -> None:
+    def _mint(self, attribution: ExcursionAttribution | None = None) -> None:
+        extra_claims = {"coord_ws_id": self._coord_ws_id}
+        if attribution is not None:
+            extra_claims.update(attribution.to_claims())
         self._token = create_jwt(
             user_id=self._user_id,
             scopes=self._scopes,
@@ -456,7 +461,7 @@ class CoordinatorTokenManager:
             audience=JWT_AUD_CONSOLE,
             permissions=self._permissions,
             expiry_seconds=self._ttl,
-            extra_claims={"coord_ws_id": self._coord_ws_id},
+            extra_claims=extra_claims,
         )
         self._expires_at = time.time() + self._ttl
         # Observability — without this, mint races + premature-401
@@ -472,9 +477,28 @@ class CoordinatorTokenManager:
 
     @property
     def token(self) -> str:
+        return self.token_for(None)
+
+    def token_for(self, attribution: ExcursionAttribution | None) -> str:
+        """Mint for the owner ``sub`` plus optional excursion claims."""
+
+        key = (
+            (
+                attribution.principal_id,
+                attribution.excursion_id,
+                attribution.cause_action_id,
+                attribution.cause_workstream_id,
+            )
+            if attribution is not None
+            else None
+        )
         with self._lock:
-            if time.time() >= self._expires_at - self._margin:
-                self._mint()
+            if key != self._attribution_key or time.time() >= self._expires_at - self._margin:
+                if attribution is None:
+                    self._mint()
+                else:
+                    self._mint(attribution)
+                self._attribution_key = key
             return self._token
 
 
@@ -528,10 +552,13 @@ class CoordinatorClient:
         timeout: float = 30.0,
         http_client: httpx.Client | None = None,
         child_event_bus: ChildEventBus,
+        attribution_token_factory: Callable[[ExcursionAttribution | None], str] | None = None,
     ) -> None:
         self._base_url = console_base_url.rstrip("/")
         self._storage = storage
         self._token_factory = token_factory
+        self._attribution_token_factory = attribution_token_factory
+        self._excursion_attribution: ExcursionAttribution | None = None
         self._coord_ws_id = coord_ws_id
         self._user_id = user_id
         self._timeout = timeout
@@ -579,8 +606,61 @@ class CoordinatorClient:
 
     # -- internal helpers ---------------------------------------------------
 
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token_factory()}"}
+    def bind_excursion(self, attribution: ExcursionAttribution | None) -> None:
+        """Set the signed control context for subsequent routed actions."""
+
+        self._excursion_attribution = attribution
+
+    def _headers(
+        self,
+        attribution: ExcursionAttribution | None = None,
+    ) -> dict[str, str]:
+        effective = attribution if attribution is not None else self._excursion_attribution
+        if self._attribution_token_factory is not None:
+            token = self._attribution_token_factory(effective)
+        else:
+            token = self._token_factory()
+        return {"Authorization": f"Bearer {token}"}
+
+    def attribution_for_workstream(
+        self,
+        ws_id: str,
+    ) -> tuple[ExcursionAttribution | None, str]:
+        """Resolve trusted causal attribution from an owned workstream.
+
+        This is the gate behind model-supplied causal references: ownership is
+        checked first and the principal is read from shell-persisted config,
+        never accepted from tool arguments.
+        """
+
+        resolved, ref_err = self._resolve_ws_ref(ws_id)
+        if ref_err is not None:
+            return None, str(ref_err.get("error") or "workstream not found")
+        if not self._is_own_subtree(resolved):
+            return None, f"workstream not in coordinator subtree: {resolved}"
+        return self._load_excursion_attribution(resolved)
+
+    def _load_excursion_attribution(
+        self,
+        ws_id: str,
+    ) -> tuple[ExcursionAttribution | None, str]:
+        """Load attribution after the caller has established subtree ownership."""
+
+        try:
+            config = self._storage.load_workstream_config(ws_id) or {}
+            attribution = ExcursionAttribution.from_config(config)
+        except (TypeError, ValueError):
+            return None, f"workstream has invalid excursion attribution: {ws_id}"
+        except Exception:
+            log.debug(
+                "coord_client.attribution_load_failed ws=%s",
+                ws_id[:8],
+                exc_info=True,
+            )
+            return None, f"workstream attribution unavailable: {ws_id}"
+        if attribution is None:
+            return None, f"workstream has no resolved excursion attribution: {ws_id}"
+        return attribution, ""
 
     def _post(
         self,
@@ -588,6 +668,7 @@ class CoordinatorClient:
         body: dict[str, Any],
         *,
         ws_id: str | None = None,
+        attribution: ExcursionAttribution | None = None,
     ) -> dict[str, Any]:
         """POST to a routing-proxy path. ``ws_id`` is interpolated into
         the path template when it has a ``{ws_id}`` slot (post-#422
@@ -602,7 +683,12 @@ class CoordinatorClient:
             path = template.format(ws_id=ws_id)
         else:
             path = template
-        return self._post_url(f"{self._base_url}{path}", body, log_path=template)
+        return self._post_url(
+            f"{self._base_url}{path}",
+            body,
+            log_path=template,
+            attribution=attribution,
+        )
 
     def _post_url(
         self,
@@ -610,6 +696,7 @@ class CoordinatorClient:
         body: dict[str, Any],
         *,
         log_path: str,
+        attribution: ExcursionAttribution | None = None,
     ) -> dict[str, Any]:
         """POST a pre-built URL with the canonical error handling.
 
@@ -621,7 +708,11 @@ class CoordinatorClient:
         per-session ids that would fragment log aggregation.
         """
         try:
-            resp = self._http.post(url, json=body, headers=self._headers())
+            resp = self._http.post(
+                url,
+                json=body,
+                headers=self._headers(attribution),
+            )
         except httpx.HTTPError as exc:
             log.warning("coord_client.http_error path=%s err=%s", log_path, exc)
             return {"error": f"upstream unreachable: {exc}", "status": 0}
@@ -874,6 +965,7 @@ class CoordinatorClient:
         target_node: str = "",
         project: str = "",
         persona: str = "",
+        attribution: ExcursionAttribution | None = None,
     ) -> dict[str, Any]:
         """Create a child workstream via the routing proxy."""
         body: dict[str, Any] = {
@@ -897,15 +989,32 @@ class CoordinatorClient:
             # handler at child-creation time.  Omitted = the interactive
             # kind default — never the parent's persona.
             body["persona"] = persona
-        return self._post("spawn", body)
+        return self._post("spawn", body, attribution=attribution)
 
-    def send(self, ws_id: str, message: str) -> dict[str, Any]:
+    def send(
+        self,
+        ws_id: str,
+        message: str,
+        *,
+        attribution: ExcursionAttribution | None = None,
+    ) -> dict[str, Any]:
         resolved, ref_err = self._resolve_owned(ws_id)
         if ref_err is not None:
             return ref_err
-        return self._post("send", {"message": message}, ws_id=resolved)
+        return self._post(
+            "send",
+            {"message": message},
+            ws_id=resolved,
+            attribution=attribution,
+        )
 
-    def emit_audit(self, action: str, detail: dict[str, Any]) -> None:
+    def emit_audit(
+        self,
+        action: str,
+        detail: dict[str, Any],
+        *,
+        attribution: ExcursionAttribution | None = None,
+    ) -> None:
         """Record an audit row attributed to this coordinator session.
 
         Uses the client's own ``storage``, ``user_id``, and
@@ -917,11 +1026,18 @@ class CoordinatorClient:
 
         record_audit(
             self._storage,
-            user_id=self._user_id,
+            user_id=(attribution.principal_id if attribution is not None else self._user_id),
             action=action,
             resource_type="coordinator",
             resource_id=self._coord_ws_id,
-            detail=detail,
+            detail={
+                **detail,
+                **(
+                    {"excursion_attribution": attribution.to_public_dict()}
+                    if attribution is not None
+                    else {}
+                ),
+            },
         )
 
     def close_workstream(self, ws_id: str, reason: str = "") -> dict[str, Any]:
@@ -1370,10 +1486,11 @@ class CoordinatorClient:
                 bus.unregister_waiter(own_subtree, wake_event)
         # Bundle each terminal child's last assistant message inline so the
         # coordinator LLM doesn't have to follow up with one
-        # ``inspect_workstream`` per ws.  Only ``idle`` / ``error`` ws_ids
-        # actually hit storage (``closed`` / ``not_found`` return a sentinel
-        # without I/O), so split them and parallelize the storage-bound
-        # subset across a small thread pool — at the WAIT_MAX_WS_IDS=32
+        # ``inspect_workstream`` per ws. Real terminal children also load
+        # their durable attribution in this pass (message extraction for
+        # ``closed`` / ``deleted`` remains a no-I/O sentinel), so parallelize
+        # the storage-bound subset across a small thread pool — at the
+        # WAIT_MAX_WS_IDS=32
         # cap, 8 workers cuts a worst-case all-idle fan-out from 32
         # sequential storage round-trips down to 4 batches, which lands
         # inside the WAIT_HEARTBEAT_INTERVAL the model already tolerates
@@ -1383,22 +1500,37 @@ class CoordinatorClient:
         io_wids = [
             wid
             for wid, snap in last_results.items()
-            if str(snap.get("state") or "") in ("idle", "error")
+            if str(snap.get("state") or "") in self._WAIT_REAL_TERMINAL_STATES
         ]
-        io_pairs: dict[str, tuple[str | None, bool]] = {}
+        io_pairs: dict[
+            str,
+            tuple[str | None, bool, dict[str, str] | None, str],
+        ] = {}
         if io_wids:
 
-            def _enrich(wid: str) -> tuple[str, str | None, bool]:
+            def _enrich(
+                wid: str,
+            ) -> tuple[str, str | None, bool, dict[str, str] | None, str]:
                 state = str(last_results[wid].get("state") or "")
                 msg, trunc = _wait_message_for(self._storage, wid, state)
-                return wid, msg, trunc
+                # Ownership was already established by the batched pre-filter
+                # and every loop snapshot. Avoid a per-id get_workstream read
+                # in the final enrichment pass.
+                attribution, attribution_error = self._load_excursion_attribution(wid)
+                return (
+                    wid,
+                    msg,
+                    trunc,
+                    attribution.to_public_dict() if attribution is not None else None,
+                    attribution_error,
+                )
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(8, len(io_wids)),
                 thread_name_prefix="coord-wait-enrich",
             ) as ex:
-                for wid, msg, trunc in ex.map(_enrich, io_wids):
-                    io_pairs[wid] = (msg, trunc)
+                for wid, msg, trunc, attribution, attribution_error in ex.map(_enrich, io_wids):
+                    io_pairs[wid] = (msg, trunc, attribution, attribution_error)
 
         # Build the final dict.  Fresh per-ws dicts (not in-place
         # mutation) so any in-flight ``wait_progress`` SSE event still
@@ -1410,12 +1542,21 @@ class CoordinatorClient:
         for wid, snap in last_results.items():
             state = str(snap.get("state") or "")
             if wid in io_pairs:
-                msg, trunc = io_pairs[wid]
+                msg, trunc, attribution, attribution_error = io_pairs[wid]
             elif state in WAIT_TERMINAL_STATES:
                 msg, trunc = _wait_message_for(self._storage, wid, state)
+                attribution, attribution_error = None, ""
             else:
                 msg, trunc = None, False
+                attribution, attribution_error = None, ""
             enriched_results[wid] = {**snap, "message": msg, "truncated": trunc}
+            if attribution is not None:
+                enriched_results[wid]["excursion_attribution"] = attribution
+            elif (
+                attribution_error
+                and "has no resolved excursion attribution" not in attribution_error
+            ):
+                enriched_results[wid]["attribution_error"] = attribution_error
         response: dict[str, Any] = {
             "results": enriched_results,
             "complete": complete,

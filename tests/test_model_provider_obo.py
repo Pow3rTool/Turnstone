@@ -630,6 +630,16 @@ class TestModelOboToken:
             user_id=USER, audience=AUDIENCE
         )
 
+    def test_obo_alias_refuses_mixed_principal_excursion(self) -> None:
+        reg = _registry_with(self._obo_cfg())
+        sess = _fake_session(registry=reg, user_id=USER, mint_token="minted-jwt")
+        sess._excursion_conflicting_principals = frozenset({"jared", "john"})
+
+        with pytest.raises(BackendAuthUnavailableError, match="ambiguous"):
+            ChatSession._model_backend_auth_token(sess, "tf")
+
+        sess._mcp_mint_client.mint_model_obo_token_sync.assert_not_called()
+
     def test_token_is_provider_agnostic(self) -> None:
         # The raw token is returned regardless of provider surface — the caller
         # binds it via ``with_options(api_key=...)``, so there is no per-provider

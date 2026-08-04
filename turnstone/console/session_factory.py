@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.console.coordinator_client import CoordinatorClient
+    from turnstone.core.attribution import ExcursionAttribution
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelRegistry
@@ -106,6 +107,8 @@ def build_console_session_factory(
         project_id: str = "",
         judge_model: str | None = None,
         persona_snapshot: PersonaSnapshot | None = None,
+        excursion_attribution: ExcursionAttribution | None = None,
+        excursion_conflicting_principals: frozenset[str] | None = None,
     ) -> ChatSession:
         assert ui is not None, "console session_factory requires a non-None UI"
         if kind != WorkstreamKind.COORDINATOR:
@@ -236,6 +239,8 @@ def build_console_session_factory(
             project_id=project_id,
             coord_client=coord_client,
             persona_snapshot=persona_snapshot,
+            excursion_attribution=excursion_attribution,
+            excursion_conflicting_principals=excursion_conflicting_principals,
         )
 
     return factory

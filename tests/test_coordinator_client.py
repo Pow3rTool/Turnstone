@@ -21,6 +21,7 @@ from turnstone.console.coordinator_client import (
     CoordinatorClient,
     CoordinatorTokenManager,
 )
+from turnstone.core.attribution import ExcursionAttribution
 from turnstone.core.auth import JWT_AUD_CONSOLE, validate_jwt
 from turnstone.core.child_event_bus import ChildEventBus
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -67,6 +68,36 @@ def test_token_manager_embeds_coord_ws_id_claim():
     decoded = jwt.decode(token, _SECRET, algorithms=["HS256"], audience=JWT_AUD_CONSOLE)
     assert decoded["coord_ws_id"] == "coord-42"
     assert decoded["src"] == "coordinator"
+
+
+def test_token_manager_keeps_owner_sub_and_signs_excursion_principal():
+    import jwt
+
+    tm = CoordinatorTokenManager(
+        user_id="jared",
+        scopes=frozenset({"write"}),
+        permissions=frozenset({"admin.coordinator"}),
+        secret=_SECRET,
+        coord_ws_id="coord-42",
+    )
+    attribution = ExcursionAttribution.start(
+        "john",
+        excursion_id="exc-john",
+        cause_action_id="call-d",
+        cause_workstream_id="coord-42",
+    )
+
+    decoded = jwt.decode(
+        tm.token_for(attribution),
+        _SECRET,
+        algorithms=["HS256"],
+        audience=JWT_AUD_CONSOLE,
+    )
+
+    assert decoded["sub"] == "jared"
+    assert decoded["excursion_principal_id"] == "john"
+    assert decoded["excursion_id"] == "exc-john"
+    assert decoded["excursion_cause_action_id"] == "call-d"
 
 
 def test_token_manager_refreshes_near_expiry(monkeypatch):
@@ -1287,6 +1318,21 @@ def test_wait_for_workstream_returns_immediately_when_already_terminal(
     assert result["results"]["child-a"]["state"] == "idle"
     # Must finish in well under the requested timeout.
     assert result["elapsed"] < 1.0
+
+
+def test_wait_for_workstream_returns_trusted_excursion_attribution(populated_storage):
+    attribution = ExcursionAttribution.start(
+        "john",
+        excursion_id="exc-john",
+        cause_action_id="spawn-b",
+        cause_workstream_id="coord-1",
+    )
+    populated_storage.save_workstream_config("child-a", attribution.to_config())
+    client = _make_read_client(populated_storage)
+
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+
+    assert result["results"]["child-a"]["excursion_attribution"] == (attribution.to_public_dict())
 
 
 def test_wait_for_workstream_any_mode_returns_when_first_terminal(

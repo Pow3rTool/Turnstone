@@ -15,6 +15,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from turnstone.core.attribution import ExcursionAttribution
 from turnstone.core.metacognition import TASK_NOTE_MAX, TASK_TITLE_MAX
 from turnstone.core.session import ChatSession
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -251,6 +252,24 @@ def test_spawn_exec_calls_client_and_returns_summary(coord_session):
     assert "child-7" in output
 
 
+def test_spawn_prepare_pins_principal_if_context_changes_before_execute(coord_session):
+    """An already-proposed action retains its prepare-time attribution
+    rather than rereading mutable session state in its executor."""
+
+    sess, coord, _ui = coord_session
+    john = sess.begin_excursion("john")
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "already proposed"}))
+    jared = ExcursionAttribution.start("jared", excursion_id="exc-jared")
+    sess.begin_excursion("jared", inherited=jared)
+    coord.spawn.return_value = {"ws_id": "child-7", "status": 200}
+
+    sess._exec_spawn_workstream(item)
+
+    sent = coord.spawn.call_args.kwargs["attribution"]
+    assert sent.principal_id == "john"
+    assert sent.excursion_id == john.excursion_id
+
+
 def test_spawn_exec_does_not_surface_misleading_status_field(coord_session):
     """The routing-proxy ``status`` is the HTTP code (always 200 on
     success), not a lifecycle state — leaking it into the tool's
@@ -389,7 +408,7 @@ def test_send_exec_dispatches(coord_session):
     coord.send.return_value = {"status": 200}
     item = sess._prepare_tool(_tc("send_to_workstream", {"ws_id": "x", "message": "hi"}))
     _call_id, output = sess._exec_send_to_workstream(item)
-    coord.send.assert_called_once_with("x", "hi")
+    coord.send.assert_called_once_with("x", "hi", attribution=ANY)
     assert "x" in output
 
 
@@ -590,6 +609,115 @@ def test_wait_exec_preserves_explicit_zero_timeout(coord_session):
     coord.wait_for_workstream.assert_called_once_with(
         ["a"], timeout=0, mode="any", since=None, progress_callback=ANY
     )
+
+
+def test_wait_adopts_returned_child_trusted_principal(coord_session):
+    sess, coord, _ui = coord_session
+    sess.begin_excursion("john")
+    jared = ExcursionAttribution.start("jared", excursion_id="exc-jared")
+    coord.wait_for_workstream.return_value = {
+        "results": {
+            "child-b": {
+                "state": "idle",
+                "tokens": 1,
+                "excursion_attribution": jared.to_public_dict(),
+            }
+        },
+        "complete": True,
+        "elapsed": 0.1,
+        "mode": "any",
+    }
+
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["child-b"]}))
+    sess._exec_wait_for_workstream(item)
+    sess._fold_child_effect_attribution([item])
+
+    assert sess._excursion_attribution == jared
+    assert sess._mcp_effective_user_id == "jared"
+
+
+def test_mixed_child_principals_require_a_trusted_causal_reference(coord_session):
+    sess, coord, ui = coord_session
+    john = ExcursionAttribution.start("john", excursion_id="exc-john")
+    jared = ExcursionAttribution.start("jared", excursion_id="exc-jared")
+    coord.wait_for_workstream.return_value = {
+        "results": {
+            "child-d": {
+                "state": "idle",
+                "tokens": 1,
+                "excursion_attribution": john.to_public_dict(),
+            },
+            "child-b": {
+                "state": "idle",
+                "tokens": 1,
+                "excursion_attribution": jared.to_public_dict(),
+            },
+        },
+        "complete": True,
+        "elapsed": 0.1,
+        "mode": "all",
+    }
+    wait_item = sess._prepare_tool(
+        _tc("wait_for_workstream", {"ws_ids": ["child-d", "child-b"], "mode": "all"})
+    )
+    sess._exec_wait_for_workstream(wait_item)
+    sess._fold_child_effect_attribution([wait_item])
+    assert sess._excursion_conflicting_principals == frozenset({"jared", "john"})
+    assert sess._mcp_effective_user_id is None
+
+    coord.spawn.reset_mock()
+    spawn_item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "continue"}))
+    assert "cause_workstream_id is required" in spawn_item["error"]
+    coord.spawn.assert_not_called()
+
+    coord.attribution_for_workstream.return_value = (jared, "")
+    coord.spawn.return_value = {"ws_id": "child-next", "status": 200}
+    caused_item = sess._prepare_tool(
+        _tc(
+            "spawn_workstream",
+            {"initial_message": "continue B", "cause_workstream_id": "child-b"},
+            call_id="call-next",
+        )
+    )
+    _call_id, output = sess._exec_spawn_workstream(caused_item)
+    assert "child-next" in output
+    sent = coord.spawn.call_args.kwargs["attribution"]
+    assert sent.principal_id == "jared"
+    assert sent.cause_action_id == "call-next"
+
+
+def test_parallel_wait_calls_join_principals_after_every_sibling_settles(coord_session):
+    sess, coord, _ui = coord_session
+    john = ExcursionAttribution.start("john", excursion_id="exc-john")
+    jared = ExcursionAttribution.start("jared", excursion_id="exc-jared")
+
+    def wait_result(ws_ids, **_kwargs):
+        ws_id = ws_ids[0]
+        attribution = john if ws_id == "child-d" else jared
+        return {
+            "results": {
+                ws_id: {
+                    "state": "idle",
+                    "tokens": 1,
+                    "excursion_attribution": attribution.to_public_dict(),
+                }
+            },
+            "complete": True,
+            "elapsed": 0.1,
+            "mode": "any",
+        }
+
+    coord.wait_for_workstream.side_effect = wait_result
+
+    sess._execute_tools(
+        [
+            _tc("wait_for_workstream", {"ws_ids": ["child-d"]}, call_id="wait-d"),
+            _tc("wait_for_workstream", {"ws_ids": ["child-b"]}, call_id="wait-b"),
+        ]
+    )
+
+    assert sess._excursion_conflicting_principals == frozenset({"jared", "john"})
+    assert sess._mcp_effective_user_id is None
 
 
 def test_delete_prepare_needs_approval(coord_session):

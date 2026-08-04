@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from turnstone.core.attribution import ExcursionAttribution
 from turnstone.core.session_manager import SessionKindAdapter, SessionManager
 from turnstone.core.workstream import (
     BULK_CLOSE_STATE_VALUES,
@@ -781,6 +782,29 @@ def test_open_threads_saved_model_alias_into_build_session() -> None:
 
     assert reopened is not None
     assert adapter.last_build_model == "gpt-5-pro"
+
+
+def test_open_restores_excursion_attribution_before_session_build() -> None:
+    class AttributionRecordingAdapter(FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.last_excursion_attribution: object | None = None
+
+        def build_session(self, ws: Workstream, **kwargs: object) -> Any:
+            self.last_excursion_attribution = kwargs.get("excursion_attribution")
+            return super().build_session(ws, **kwargs)
+
+    adapter = AttributionRecordingAdapter()
+    mgr, _, storage = _make_manager(adapter)
+    ws = mgr.create(user_id="jared")
+    attribution = ExcursionAttribution.start("john", excursion_id="exc-john")
+    storage.ws_config[ws.id] = attribution.to_config()
+    mgr.close(ws.id)
+
+    reopened = mgr.open(ws.id)
+
+    assert reopened is not None
+    assert adapter.last_excursion_attribution == attribution
 
 
 def test_open_drops_saved_alias_when_validator_rejects() -> None:

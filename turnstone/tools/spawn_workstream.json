@@ -31,6 +31,10 @@
       "persona": {
         "type": "string",
         "description": "Optional persona name for the child (children are always interactive-kind, so the persona must apply to interactive workstreams). The persona is resolved and snapshotted at spawn time. Omit for the interactive default persona — the child never inherits this coordinator's persona."
+      },
+      "cause_workstream_id": {
+        "type": "string",
+        "description": "Optional causal child workstream id. Use when this action follows a returned child result and the coordinator step contains multiple trusted principals. The shell reads that owned child's persisted excursion attribution; you cannot supply a principal directly. Omit to inherit the coordinator's unambiguous current excursion."
       }
     },
     "required": []

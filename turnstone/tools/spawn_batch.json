@@ -33,6 +33,10 @@
             "persona": {
               "type": "string",
               "description": "Optional persona name for the child (must apply to interactive workstreams). Snapshotted at spawn; invalid names land in denied[]. Omit for the interactive default — children never inherit this coordinator's persona."
+            },
+            "cause_workstream_id": {
+              "type": "string",
+              "description": "Optional causal child workstream id. Required per item when a mixed-principal coordinator step cannot inherit one principal. The shell resolves attribution from that owned child."
             }
           },
           "required": []

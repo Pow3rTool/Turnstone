@@ -67,6 +67,30 @@ def test_coordinator_source_is_preserved_on_remint():
     assert payload["coord_ws_id"] == "coord-42"
 
 
+def test_coordinator_excursion_claims_are_preserved_on_remint():
+    claims = {
+        "coord_ws_id": "coord-42",
+        "excursion_attribution_version": "1",
+        "excursion_principal_id": "john",
+        "excursion_id": "exc-john",
+        "excursion_cause_action_id": "call-d",
+        "excursion_cause_workstream_id": "coord-42",
+    }
+    auth = AuthResult(
+        user_id="jared",
+        scopes=frozenset({"write"}),
+        token_source="coordinator",
+        permissions=frozenset({"admin.coordinator"}),
+        extra_claims=claims,
+    )
+
+    payload = _decode(_proxy_auth_headers(_build_request(auth)))
+
+    assert payload["sub"] == "jared"
+    for key, value in claims.items():
+        assert payload[key] == value
+
+
 def test_coord_ws_id_absent_when_not_in_inbound_claims():
     """Defensive: if the inbound token is src=coordinator but missing the
     coord_ws_id claim (shouldn't happen in practice), the re-mint skips

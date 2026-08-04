@@ -47,6 +47,11 @@ from turnstone.core.attachments import (
     safe_attachment_label,
     unreadable_placeholder,
 )
+from turnstone.core.attribution import (
+    ExcursionAttribution,
+    ambiguous_attribution_config,
+    conflicting_principals_from_config,
+)
 from turnstone.core.background_shells import (
     _FILTER_MAX_LINE_CHARS,
     BackgroundShell,
@@ -1480,6 +1485,8 @@ class ChatSession:
         coord_client: Any = None,
         project_id: str = "",
         persona_snapshot: PersonaSnapshot | None = None,
+        excursion_attribution: ExcursionAttribution | None = None,
+        excursion_conflicting_principals: frozenset[str] | None = None,
     ):
         if kind == WorkstreamKind.COORDINATOR and not user_id:
             # Coordinators carry real authority — they mint child-spawn
@@ -1571,18 +1578,24 @@ class ChatSession:
         # Listener identity, catalog merge, and dispatch all consume
         # this through ``_mcp_user_id``.
         self._mcp_user_id: str | None = user_id or None
-        # Acting user for per-user MCP credential resolution on SHARED
-        # workstreams: the authenticated principal who most recently
-        # initiated a turn (bound by ``bind_acting_user`` from the send
-        # path). Empty until the first authenticated send, and empty
-        # forever on CLI / eval / scheduled sessions — every consumer
-        # goes through ``_mcp_effective_user_id``, which falls back to
-        # the session owner. Rebinding also swaps the user-scoped MCP
-        # listeners; ``_mcp_listener_user_id`` tracks the identity the
-        # current registrations were made under (listener identity is
-        # the ``(user_id, callback)`` pair).
-        self._acting_user_id: str = ""
-        self._mcp_listener_user_id: str | None = user_id or None
+        # The workstream owner is durable tenancy metadata; an excursion's
+        # trusted principal is the human whose trigger (or causally-returned
+        # child ledger) authorizes the current trigger→work→ready run.  They
+        # coincide in a single-user session but MUST remain separate in a
+        # shared coordinator.  Conflicting principals are an explicit,
+        # fail-closed state: per-user MCP/model auth gets no owner fallback.
+        self._excursion_attribution = excursion_attribution
+        self._excursion_conflicting_principals = frozenset(excursion_conflicting_principals or ())
+        if self._excursion_attribution is not None and self._excursion_conflicting_principals:
+            raise ValueError("excursion attribution cannot be resolved and ambiguous")
+        self._acting_user_id: str = (
+            self._excursion_attribution.principal_id if self._excursion_attribution else ""
+        )
+        self._mcp_listener_user_id: str | None = (
+            None
+            if self._excursion_conflicting_principals
+            else (self._acting_user_id or user_id or None)
+        )
         # Shared-workstream context state: the model must be TOLD when more
         # than one human is in the room. ``_shared_workstream`` flips True once
         # a non-owner sender appears (live send OR rehydrated history) and
@@ -2010,6 +2023,7 @@ class ChatSession:
         # recompose to the first user turn (keeps the cached prefix stable).
         self._system_composed_with_context: bool = False
         self._init_system_messages()
+        self._sync_coordinator_excursion()
         # Skip on rehydrate — ``_save_config`` is ``INSERT OR
         # REPLACE`` per-key, and the persisted row is what
         # ``ChatSession.resume`` is about to read back.  Pairs with
@@ -2366,6 +2380,10 @@ class ChatSession:
         snap = self._current_persona_snapshot()
         if snap is not None:
             config.update(snap.to_config())
+        if self._excursion_conflicting_principals:
+            config.update(ambiguous_attribution_config(set(self._excursion_conflicting_principals)))
+        elif self._excursion_attribution is not None:
+            config.update(self._excursion_attribution.to_config())
         save_workstream_config(self._ws_id, config)
 
     def _render_skill_body(
@@ -3758,6 +3776,11 @@ class ChatSession:
         # after which the next _save_config would "repair" the target's
         # stamp with a persona the operator never chose for it.
         config = load_workstream_config(ws_id)
+        resumed_attribution: ExcursionAttribution | None = None
+        resumed_conflicts: frozenset[str] = frozenset()
+        if not fork:
+            resumed_attribution = ExcursionAttribution.from_config(config or {})
+            resumed_conflicts = conflicting_principals_from_config(config or {})
         snap: PersonaSnapshot | None = None
         if not fork:
             snap = snapshot_from_config(config or {})
@@ -3894,6 +3917,13 @@ class ChatSession:
                     self._skill_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
+        if not fork:
+            self._excursion_attribution = resumed_attribution
+            self._excursion_conflicting_principals = resumed_conflicts
+            self._rebind_effective_principal(
+                resumed_attribution.principal_id if resumed_attribution else ""
+            )
+            self._sync_coordinator_excursion()
         # When forking, persist the copied messages and restored config under
         # the fork's own ws_id so they survive restarts.
         if fork:
@@ -6058,16 +6088,15 @@ class ChatSession:
 
     @property
     def _mcp_effective_user_id(self) -> str | None:
-        """Identity for per-user MCP (oauth_user) credential resolution.
+        """Trusted principal for per-user credential resolution.
 
-        The acting user — the authenticated principal who last initiated
-        a turn on this session — when one is bound; otherwise the session
-        owner. On a shared workstream this makes MCP tool calls run under
-        the credentials (and catalog) of whoever is actually driving,
-        rather than whoever created the workstream. Falls back to the
-        owner for CLI / eval / scheduled / internal turns, preserving the
-        pre-existing single-user behaviour.
+        A multi-principal causal merge has no implicit answer and therefore
+        returns ``None`` rather than borrowing the durable workstream owner.
+        Legacy/single-user lanes retain the owner fallback until their first
+        explicit excursion is bound.
         """
+        if self._excursion_conflicting_principals:
+            return None
         return self._acting_user_id or self._mcp_user_id
 
     def _model_backend_auth_token(self, alias: str) -> str | None:
@@ -6106,6 +6135,24 @@ class ChatSession:
         must_fail_closed = configured_fail_closed or not has_static_key
         user_id = ""
         if mode == "entra_obo":
+            # Auth-resolver unit doubles predate excursion state and invoke
+            # this method unbound on a SimpleNamespace.  Absence means the
+            # legacy, non-ambiguous case; a real ChatSession always owns the
+            # field from construction onward.
+            conflicting_principals = getattr(self, "_excursion_conflicting_principals", frozenset())
+            if conflicting_principals:
+                principals = ",".join(sorted(conflicting_principals))
+                log.warning(
+                    "model_obo.ambiguous_excursion",
+                    alias=alias,
+                    audience=cfg.obo_audience,
+                    principals=principals,
+                )
+                raise BackendAuthUnavailableError(
+                    "Delegated backend authentication is ambiguous after combining "
+                    f"multiple trusted principals for model alias {alias!r}; "
+                    "use an app-identity coordinator model or begin a new human excursion"
+                )
             user_id = (self._mcp_effective_user_id or "").strip()
             if not user_id:
                 log.warning(
@@ -6185,15 +6232,166 @@ class ChatSession:
         a plain user, even when an admin is driving — bypass is a surface
         property (cluster inspect), not a principal property.
         """
+        if self._excursion_conflicting_principals:
+            return None
         return self._acting_user_id or self._user_id or None
 
+    def _sync_coordinator_excursion(self) -> None:
+        """Publish the current control state to the coordinator HTTP client."""
+
+        client = self._coord_client
+        bind = getattr(client, "bind_excursion", None)
+        if callable(bind):
+            bind(self._excursion_attribution)
+
+    def _rebind_effective_principal(self, user_id: str) -> None:
+        """Re-scope per-user catalogs/listeners without minting an excursion."""
+
+        user_id = user_id.strip()
+        new_listener_uid: str | None = (
+            None if self._excursion_conflicting_principals else (user_id or self._mcp_user_id)
+        )
+        if user_id == self._acting_user_id and new_listener_uid == self._mcp_listener_user_id:
+            return
+        self._acting_user_id = user_id
+        mcp = self._mcp_client
+        if not mcp:
+            self._mcp_listener_user_id = new_listener_uid
+            return
+        old_listener_uid = self._mcp_listener_user_id
+        if new_listener_uid == old_listener_uid:
+            return
+        if self._mcp_refresh_cb:
+            mcp.remove_listener(self._mcp_refresh_cb, user_id=old_listener_uid)
+            mcp.add_listener(self._mcp_refresh_cb, user_id=new_listener_uid)
+        if self._mcp_resource_cb:
+            mcp.remove_resource_listener(self._mcp_resource_cb, user_id=old_listener_uid)
+            mcp.add_resource_listener(self._mcp_resource_cb, user_id=new_listener_uid)
+        if self._mcp_prompt_cb:
+            mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=old_listener_uid)
+            mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
+        self._mcp_listener_user_id = new_listener_uid
+        try_prime_user_pools(mcp, new_listener_uid, context="excursion-principal-change")
+        self._on_mcp_tools_changed()
+        self._init_system_messages()
+
+    def begin_excursion(
+        self,
+        principal_id: str,
+        *,
+        inherited: ExcursionAttribution | None = None,
+        cause_action_id: str = "",
+        cause_workstream_id: str = "",
+    ) -> ExcursionAttribution:
+        """Bind and durably persist one trigger-to-ready excursion.
+
+        ``inherited`` is accepted only from host code that already validated a
+        signed coordinator JWT.  Model/tool payloads never provide a raw
+        principal.  A human trigger creates a fresh excursion id even when the
+        same human drove the preceding turn.
+        """
+
+        attribution = inherited or ExcursionAttribution.start(
+            principal_id,
+            cause_action_id=cause_action_id,
+            cause_workstream_id=cause_workstream_id or self._ws_id,
+        )
+        self._excursion_conflicting_principals = frozenset()
+        self._excursion_attribution = attribution
+        self._rebind_effective_principal(attribution.principal_id)
+        self._sync_coordinator_excursion()
+        self._save_config()
+        return attribution
+
+    def _mark_excursion_ambiguous(self, principal_ids: set[str]) -> None:
+        """Fail closed after folding effect records from multiple principals."""
+
+        principals = frozenset(p.strip() for p in principal_ids if p.strip())
+        if len(principals) < 2:
+            raise ValueError("ambiguous excursion requires at least two principals")
+        self._excursion_attribution = None
+        self._excursion_conflicting_principals = principals
+        self._rebind_effective_principal("")
+        self._sync_coordinator_excursion()
+        self._save_config()
+
+    def _fold_child_effect_attribution(self, items: list[dict[str, Any]]) -> None:
+        """Fold all terminal-child effects at the parallel-batch boundary.
+
+        Wait tools execute concurrently with their siblings.  Mutating session
+        attribution inside each wait worker would make two independent waits
+        from different principals resolve by scheduler order.  Each worker
+        therefore records its trusted result on its own prepared item; this
+        method joins every returned effect once all workers have completed.
+        """
+
+        effect_results: list[dict[str, Any]] = []
+        action_ids: set[str] = set()
+        for item in items:
+            result = item.pop("_excursion_effect_result", None)
+            if not isinstance(result, dict):
+                continue
+            effect_results.append(result)
+            action_ids.add(str(item.get("call_id") or ""))
+        if not effect_results:
+            return
+
+        # Inline/lazy to keep ordinary interactive tool batches independent
+        # from the console layer, matching the wait executor's import seam.
+        from turnstone.console.coordinator_client import WAIT_REAL_TERMINAL_STATES
+
+        attributions: list[ExcursionAttribution] = []
+        for result in effect_results:
+            for snap in (result.get("results") or {}).values():
+                if not isinstance(snap, dict) or snap.get("state") not in WAIT_REAL_TERMINAL_STATES:
+                    continue
+                raw = snap.get("excursion_attribution")
+                if not isinstance(raw, dict):
+                    # Legacy children have no attribution envelope. Preserve
+                    # current context rather than manufacturing a principal
+                    # from the owner; newly-created children always carry it.
+                    continue
+                try:
+                    attributions.append(
+                        ExcursionAttribution(
+                            principal_id=str(raw.get("principal_id") or ""),
+                            excursion_id=str(raw.get("excursion_id") or ""),
+                            cause_action_id=str(raw.get("cause_action_id") or ""),
+                            cause_workstream_id=str(raw.get("cause_workstream_id") or ""),
+                        )
+                    )
+                except ValueError:
+                    log.warning("coord.wait.invalid_child_attribution", ws_id=self._ws_id)
+        if not attributions:
+            return
+        principals = {a.principal_id for a in attributions}
+        if len(principals) > 1:
+            self._mark_excursion_ambiguous(principals)
+            return
+        distinct = {
+            (a.principal_id, a.excursion_id, a.cause_action_id, a.cause_workstream_id): a
+            for a in attributions
+        }
+        if len(distinct) == 1:
+            inherited = next(iter(distinct.values()))
+            self.begin_excursion(inherited.principal_id, inherited=inherited)
+            return
+        # Several causal branches from the same trusted principal may be
+        # synthesized under that principal, but no single prior excursion id
+        # truthfully represents the join. Start a new, explicitly joined
+        # excursion instead of choosing one branch by ordering.
+        self.begin_excursion(
+            next(iter(principals)),
+            cause_action_id=(next(iter(action_ids)) if len(action_ids) == 1 else ""),
+            cause_workstream_id=self._ws_id,
+        )
+
     def bind_acting_user(self, user_id: str) -> None:
-        """Bind the authenticated initiator of the current turn.
+        """Begin an excursion for an authenticated human turn.
 
         Called from the HTTP send path with the caller's authenticated
-        user id. No-ops when ``user_id`` is empty (unauthenticated lanes
-        keep the owner fallback) or unchanged. On a genuine change this
-        re-scopes the session's MCP view to the new acting user:
+        user id. Empty ids leave legacy/unauthenticated lanes untouched.
+        Rebinding scopes the session's MCP view to the trusted principal:
 
         - swaps the user-scoped tool/resource/prompt listeners so pool
           catalog changes for the acting user reach this session
@@ -6203,55 +6401,13 @@ class ChatSession:
         - rebuilds the merged tool list and catalog-dependent state via
           the same callbacks a pool notification would fire.
 
-        The binding is sticky — it persists until the next authenticated
-        send — so wake nudges and auto-resume continuations keep running
-        under the user whose turn they continue. It intentionally does
-        NOT rebind mid-turn: queued interjections fold into the current
-        turn under the initiator's identity, and prepared tool items pin
-        the identity at prepare time (see ``_prepare_mcp_tool``).
+        The attribution is sticky through wake nudges and autonomous
+        continuations, but a later authenticated send always starts a new
+        excursion. It intentionally does NOT rebind mid-turn.
         """
-        if not user_id or user_id == (self._acting_user_id or self._user_id):
-            self._acting_user_id = self._acting_user_id or user_id
+        if not user_id:
             return
-        self._acting_user_id = user_id
-        mcp = self._mcp_client
-        # Coordinators participate fully (#725): they are multi-sender by
-        # design (any admin.coordinator operator with project visibility
-        # may drive one — ownership is not enforced), so an acting-user
-        # change MUST re-scope the listeners and prime the new user's
-        # pools below; otherwise operator B would dispatch against
-        # operator A's primed pool catalog.
-        if not mcp:
-            return
-        old_listener_uid = self._mcp_listener_user_id
-        new_listener_uid: str | None = self._mcp_effective_user_id
-        if new_listener_uid != old_listener_uid:
-            if self._mcp_refresh_cb:
-                mcp.remove_listener(self._mcp_refresh_cb, user_id=old_listener_uid)
-                mcp.add_listener(self._mcp_refresh_cb, user_id=new_listener_uid)
-            if self._mcp_resource_cb:
-                mcp.remove_resource_listener(self._mcp_resource_cb, user_id=old_listener_uid)
-                mcp.add_resource_listener(self._mcp_resource_cb, user_id=new_listener_uid)
-            if self._mcp_prompt_cb:
-                mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=old_listener_uid)
-                mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
-            self._mcp_listener_user_id = new_listener_uid
-        try_prime_user_pools(mcp, new_listener_uid, context="acting-user-change")
-        # Rebuild the merged tool list and resource/prompt-dependent
-        # state under the new identity NOW — the prime above completes
-        # asynchronously and only notifies on catalog changes, while
-        # already-warm pool entries for this user produce no
-        # notification at all.  ONE _init_system_messages() covers both
-        # the resource and prompt catalogs: the _on_mcp_resources_changed
-        # / _on_mcp_prompts_changed wrappers are pure passthroughs to it
-        # (they exist for the manager's separate notification channels,
-        # which still fire them independently), and it rebuilds the full
-        # system message copy-on-write — calling it twice per handoff was
-        # a redundant list_prompt_policies() read + compose per rebind.
-        # The persona-catalog read inside the tools rebuild stays as-is:
-        # sender-independent but handoff-frequency, not worth memoizing.
-        self._on_mcp_tools_changed()
-        self._init_system_messages()
+        self.begin_excursion(user_id)
 
     def send(
         self,
@@ -8483,6 +8639,14 @@ class ChatSession:
         """
         if not rows or budget <= 0:
             return ""
+        # A complete section needs no truncation pointer.  Check that case
+        # first: the incremental loop below reserves a pointer while rows are
+        # still behind, which can otherwise reject the first row even though
+        # all rows fit once that pointer disappears (notably a short child
+        # workstream list in its reserved slice of the handles budget).
+        complete = heading + "".join(rows)
+        if len(complete) <= budget:
+            return complete
         kept: list[str] = []
         used = len(heading)
         for i, row in enumerate(rows):
@@ -10456,6 +10620,10 @@ class ChatSession:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                     results = list(pool.map(run_one, items))
 
+        # Child wait receipts are causal effect records.  Fold them only after
+        # every parallel sibling has settled so principal selection is a set
+        # join, never a ThreadPoolExecutor completion-order race.
+        self._fold_child_effect_attribution(items)
         return results, user_feedback
 
     @staticmethod
@@ -12698,6 +12866,44 @@ class ChatSession:
         the sanitized value."""
         return " ".join((value or "").split())[:cap]
 
+    def _coordinator_action_attribution(
+        self,
+        *,
+        call_id: str,
+        cause_workstream_id: str = "",
+    ) -> tuple[ExcursionAttribution | None, str]:
+        """Resolve one delegated action's principal through trusted state."""
+
+        # A few compatibility/unit shells deliberately allocate ChatSession
+        # with ``__new__`` and exercise only coordinator approval shaping.  A
+        # real session always initializes this field; retain the old shell
+        # behavior without inventing an identity for the incomplete object.
+        if not hasattr(self, "_excursion_attribution") and not cause_workstream_id:
+            return None, ""
+        attribution = self._excursion_attribution
+        if cause_workstream_id:
+            attribution, error = self._coord_client.attribution_for_workstream(cause_workstream_id)
+            if error:
+                return None, error
+        elif self._excursion_conflicting_principals:
+            return (
+                None,
+                "multiple trusted principals contributed to this coordinator step; "
+                "cause_workstream_id is required",
+            )
+        if attribution is None:
+            principal_id = (self._mcp_effective_user_id or "").strip()
+            if not principal_id:
+                return None, "no trusted principal is bound to this excursion"
+            attribution = self.begin_excursion(principal_id)
+        return (
+            attribution.for_spawn_edge(
+                action_id=call_id,
+                cause_workstream_id=self._ws_id,
+            ),
+            "",
+        )
+
     def _prepare_spawn_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(
@@ -12718,6 +12924,7 @@ class ChatSession:
         name = self._flatten_spawn_arg(args.get("name"), 120)
         target_node = self._flatten_spawn_arg(args.get("target_node"), 64)
         persona = self._flatten_spawn_arg(args.get("persona"), 64)
+        cause_workstream_id = self._coord_str_arg(args, "cause_workstream_id").strip()
         if persona:
             persona, persona_err = self._validate_child_persona(persona)
             if persona_err:
@@ -12743,6 +12950,12 @@ class ChatSession:
         if target_node:
             header_bits.append(f"node={target_node}")
         header = " ".join(header_bits)
+        attribution, attribution_error = self._coordinator_action_attribution(
+            call_id=call_id,
+            cause_workstream_id=cause_workstream_id,
+        )
+        if attribution_error:
+            return self._coord_tool_error(call_id, "spawn_workstream", attribution_error)
         return {
             "call_id": call_id,
             "func_name": "spawn_workstream",
@@ -12758,6 +12971,8 @@ class ChatSession:
             "target_node": target_node,
             "project": project,
             "persona": persona,
+            "cause_workstream_id": cause_workstream_id,
+            "excursion_attribution": attribution,
         }
 
     def _validate_child_persona(self, persona: str) -> tuple[str, str]:
@@ -12789,6 +13004,7 @@ class ChatSession:
 
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        attribution = item.get("excursion_attribution")
         try:
             result = self._coord_client.spawn(
                 initial_message=item["initial_message"],
@@ -12800,6 +13016,7 @@ class ChatSession:
                 target_node=item["target_node"],
                 project=item["project"],
                 persona=item["persona"],
+                attribution=attribution,
             )
         except Exception as e:
             msg = f"Error: spawn_workstream failed: {e}"
@@ -12897,6 +13114,7 @@ class ChatSession:
             name = self._flatten_spawn_arg(self._coord_str_arg(raw, "name"), 120)
             target_node = self._flatten_spawn_arg(self._coord_str_arg(raw, "target_node"), 64)
             persona = self._flatten_spawn_arg(self._coord_str_arg(raw, "persona"), 64)
+            cause_workstream_id = self._coord_str_arg(raw, "cause_workstream_id").strip()
             spec: dict[str, Any] = {
                 "idx": idx,
                 "initial_message": initial_message,
@@ -12905,7 +13123,16 @@ class ChatSession:
                 "model": model,
                 "target_node": target_node,
                 "persona": persona,
+                "cause_workstream_id": cause_workstream_id,
             }
+            attribution, attribution_error = self._coordinator_action_attribution(
+                call_id=f"{call_id}:{idx}",
+                cause_workstream_id=cause_workstream_id,
+            )
+            if attribution_error:
+                spec["_error"] = attribution_error
+            else:
+                spec["excursion_attribution"] = attribution
             if persona:
                 # Same prep-time gate as spawn_workstream, but surfaced as
                 # a per-row denial (partial-success semantics) rather than
@@ -13005,6 +13232,7 @@ class ChatSession:
             if "_error" in spec:
                 denied.append({"idx": idx, "reason": spec["_error"]})
                 continue
+            attribution = spec.get("excursion_attribution")
             try:
                 result = self._coord_client.spawn(
                     initial_message=spec["initial_message"],
@@ -13015,6 +13243,7 @@ class ChatSession:
                     model=spec["model"],
                     target_node=spec["target_node"],
                     persona=spec["persona"],
+                    attribution=attribution,
                 )
             except Exception as e:
                 denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
@@ -13139,6 +13368,7 @@ class ChatSession:
             )
         ws_id = (args.get("ws_id") or "").strip()
         message = args.get("message") or ""
+        cause_workstream_id = self._coord_str_arg(args, "cause_workstream_id").strip()
         if not ws_id:
             return self._coord_tool_error(call_id, "send_to_workstream", "ws_id is required")
         if not message.strip():
@@ -13154,6 +13384,12 @@ class ChatSession:
         if self._trust_send and self._coord_client._is_own_subtree(ws_id):
             needs_approval = False
             trust_auto_approved = True
+        attribution, attribution_error = self._coordinator_action_attribution(
+            call_id=call_id,
+            cause_workstream_id=cause_workstream_id,
+        )
+        if attribution_error:
+            return self._coord_tool_error(call_id, "send_to_workstream", attribution_error)
         return {
             "call_id": call_id,
             "func_name": "send_to_workstream",
@@ -13164,11 +13400,14 @@ class ChatSession:
             "execute": self._exec_send_to_workstream,
             "ws_id": ws_id,
             "message": message,
+            "cause_workstream_id": cause_workstream_id,
+            "excursion_attribution": attribution,
             "trust_auto_approved": trust_auto_approved,
         }
 
     def _exec_send_to_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        attribution = item.get("excursion_attribution")
         if item.get("trust_auto_approved"):
             # Audit before dispatch so a downstream failure doesn't drop the trail.
             try:
@@ -13182,11 +13421,16 @@ class ChatSession:
                         "ws_id": item["ws_id"],
                         "message_preview": preview_line[:120],
                     },
+                    attribution=attribution,
                 )
             except Exception:
                 log.debug("coord.trust_send.audit_failed", exc_info=True)
         try:
-            result = self._coord_client.send(item["ws_id"], item["message"])
+            result = self._coord_client.send(
+                item["ws_id"],
+                item["message"],
+                attribution=attribution,
+            )
         except Exception as e:
             msg = f"Error: send_to_workstream failed: {e}"
             self._report_tool_result(call_id, "send_to_workstream", msg, is_error=True)
@@ -15320,7 +15564,12 @@ class ChatSession:
                 "resolved": resolved_count,
             },
         )
-        return call_id, self._truncate_output(output)
+        # Record the terminal ledger only after the ordinary result/reporting
+        # path succeeds. _execute_tools folds all sibling wait effects together
+        # after the parallel batch settles, before the next model run.
+        rendered_output = self._truncate_output(output)
+        item["_excursion_effect_result"] = result
+        return call_id, rendered_output
 
     def _emit_wait_event(self, event_type: str, payload: dict[str, Any]) -> None:
         """Fan out a ``wait_*`` SSE event via the session UI.

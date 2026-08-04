@@ -11,6 +11,10 @@
       "message": {
         "type": "string",
         "description": "Message text to append as a user turn."
+      },
+      "cause_workstream_id": {
+        "type": "string",
+        "description": "Optional causal child workstream id. Use after combining results from multiple trusted principals; the shell resolves the delegated principal from that owned child's persisted attribution. Omit to inherit the coordinator's unambiguous current excursion."
       }
     },
     "required": ["ws_id", "message"]
