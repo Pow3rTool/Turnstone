@@ -12,112 +12,99 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
-## [Unreleased]
+## [1.8.3]
+
+Turnstone 1.8.3 makes scheduled work easier to launch, keeps conversations and node placement intact
+across restarts, strengthens sign-in and session permissions, and improves the everyday browser
+controls. It also adds GPT-6 Astra support and downloadable previews.
+
+> **Before upgrading:** this release advances the database schema from migration 072 to 076, adding
+> schedule time zones, correcting stored one-shot times, and recording channel owners and required
+> execution nodes. Migrations run automatically. Existing recurring schedules keep their UTC timing;
+> edit their time zone to switch to local time. Older Discord threads without a saved invoker need
+> a new `/ask` conversation. An administrator must assign roles to local accounts that have none.
 
 ### Added
 
-- **Scheduled tasks from the dashboard (#1090).** The console launcher's kind
-  toggle gains **Scheduled** next to Coordinator and Interactive, shown to
-  callers with `admin.schedules`. It takes the interactive field set plus a
-  When builder (Daily / Weekly / Monthly / Interval / Once / Cron with a live
-  next-runs read-out) and stores the schedule for the scheduler to dispatch;
-  a confirmation names the first run. The admin schedule shelf and the
-  launcher now share one timing builder; its "next runs" read-out shows each
-  run in the browser's local zone, and the shelf's NEXT RUN column now
-  converts the server's UTC time to local time instead of relabelling it.
-- **Schedules run in the operator's time zone (#1091).** A recurring schedule
-  now stores the IANA zone its cron is evaluated in (`timezone` on
-  `scheduled_tasks`, migration 073; `POST`/`PUT /v1/api/admin/schedules`, the
-  preview endpoint and the SDK accept it; an unknown zone, or a cron that
-  never matches a real calendar date, is refused). The timing builder detects the
-  browser's zone, labels the recurring-time inputs with it and sends it with
-  the schedule, so "02:30 daily" keeps firing at 02:30 local across
-  daylight-saving changes and a weekly day is the local day; a fixed time of
-  day fires once on the fall-back day while a cadence keeps its real-time
-  rhythm through the repeated hour (#1097); editing keeps a schedule's saved
-  zone. Existing schedules carry `UTC`, the zone they were
-  always evaluated in, and `next_run` stays stored in UTC. `tzdata` becomes
-  a direct dependency so legacy zone keys browsers still report
-  (`Asia/Calcutta`) resolve on hosts whose system database omits them, and
-  the `croniter` floor rises to 6.1, the first release whose zone-aware walk
-  handles daylight-saving changes correctly. A schedule whose zone the host
-  can no longer resolve is disabled with the reason recorded in its run
-  history.
-- **Pending-approval chip in the status bar.** When a tool call is waiting on
-  you, the workstream status bar (tokens / tools / turn) shows a sticky
-  "1 approval needed" chip, counting up when parallel task agents open several
-  gates at once, so a prompt that scrolled out of view or sits inside a
-  collapsed agent card is no longer easy to miss. Clicking it scrolls to the
-  card the keyboard shortcuts act on and puts the cursor on it. The
-  coordinator status bar shows the same chip for the coordinator's own
-  transcript, and the "x pending" count beside the coordinator's Children
-  heading becomes the same kind of chip, reading "x approvals": clicking it
-  scrolls the children list to the first child waiting on an approval. The chips and the rail's
-  attention badge share a new ink colour that reads clearly on the light
-  theme, where the old one fell short.
-
-### Fixed
-
-- **Reopening a workstream no longer spends a turn on a memory search, and a
-  message sent while it reopens starts its own turn.** Resuming a workstream
-  with saved memories queued a "check your memories" nudge outside any user
-  turn, and the idle wake delivered it on a synthetic empty turn as soon as
-  the workstream went idle. A message sent while that turn ran was queued and
-  handed to the model at the next tool seam as mid-turn "additional context"
-  instead of starting its own turn; channel sessions hit this on nearly every
-  reopen. The nudge is retired: the immutable memory index and the per-turn
-  memory pointers already put the saved context in front of the model.
-  User-channel advisories no longer arm the idle wake at all, so no advisory
-  can manufacture an empty turn ahead of the user's message. Persisted
-  `resume` turns in existing transcripts still render.
-- **One-shot schedules with a non-UTC offset fired at the wrong time
-  (#1096).** A one-shot's `at_time` was stored verbatim as its `next_run`,
-  which the due query compares as a string against a UTC clock, so an
-  `at_time` such as `2030-01-01T12:00:00+05:30` fired at 12:00 UTC rather
-  than 06:30 UTC. The offset is now folded into `next_run`, and migration
-  074 rewrites the one-shots already stored; `at_time` is kept as submitted.
-- **Schedule requests read an explicit null as a value (#1098).**
-  `PUT /v1/api/admin/schedules/{id}` gated each field on key presence and
-  `POST` read defaults only for absent keys, so a null, which the update
-  schema advertises for every field and the SDK forwards for a caller's
-  `None`, disabled the schedule (`enabled`), stored the string `"None"`
-  (`name`, `description`), or failed validation (`cron_expr`). A null is
-  now refused with a `400` naming the field on create, update and preview:
-  neither a value nor a silent no-op.
-- **A failed dispatch advanced the schedule in the auto, pool and node
-  target modes (#1099).** The scheduler counted a firing as dispatched once
-  a node was chosen, so a node without a server URL, or one that refused the
-  workstream, skipped the firing while the run history showed it `failed`;
-  only the no-reachable-node paths held the schedule, and those retried it
-  on every pass for ever. The schedule now advances only when a node created
-  the workstream. A firing that certainly made nothing (no reachable node, a
-  connection that never opened, a node's 4xx answer) is held and attempted
-  again about once a minute for five minutes after its first failure
-  (`retry_interval`, `retry_window` on the scheduler), then given up. A
-  firing whose answer does not say whether the workstream was created (a
-  lost reply, a 5xx) is not retried, since a retry could run the job twice;
-  its `failed` row says so. A given-up or unretried firing moves the
-  schedule on from the clock with `last_run` untouched, and disables a
-  one-shot with a `disabled` run-history row saying why. A fan-out under
-  retry writes one `failed` row per attempt naming each node, not one per
-  node. Held firings live in a `system_settings` row beside the scheduler
-  lock, so consoles share the pacing and a restart does not restart the
-  window. The schedule shelf reads a one-shot as completed only when its
-  last run is at or after its scheduled time, so one re-armed to a later
-  time, or converted from a cron that had run, that then never runs shows
-  as disabled.
+- **Scheduled tasks from the dashboard (#1090).** Choose Scheduled in the launcher, enter the task,
+  and pick Daily, Weekly, Monthly, Interval, Once, or Cron. The launcher and Admin Schedules share
+  a timing builder showing upcoming runs in your local time; saving confirms the first run.
+- **Recurring schedules in your time zone (#1091, #1097).** Schedules created in the browser use its
+  time zone and retain it when edited. Daily, weekly, and monthly times follow daylight-saving
+  changes, with a fixed time firing once during the repeated fall-back hour. The API and both SDKs
+  accept a time zone. Invalid zones and impossible dates are rejected with an explanation.
+- **GPT-6 Astra.** The OpenAI provider recognizes `gpt-6-astra`, including its context and output
+  limits, reasoning levels, vision, PDF input, tool search, and mid-conversation instructions.
+  Responses history also preserves the distinction between commentary and final answers, and their
+  order around tool calls, independently of whether reasoning replay is enabled.
+- **Visible approval reminders.** A persistent status-bar chip counts pending approvals and reveals
+  the waiting card, including cards inside collapsed task agents. Coordinators also have a clickable
+  approval count for child workstreams.
+- **Preview downloads.** Download the original file from a preview, including the complete table
+  when the displayed data is sorted or capped. Downloads retain the source filename and stay tied to
+  the originating workstream and node after navigation or reload.
 
 ### Changed
 
-- **Darker indicator hues in the light theme (#1092, #1094).** The
-  launcher's active kind label is drawn in its kind's hue over a tint of
-  the same hue, and in the light theme that sat just under the 4.5:1
-  text-contrast threshold; the skill shelf's origin badge had the same
-  pairing in cyan. The light theme's amber, cyan, blue, green, red,
-  yellow, magenta and two channel accents now run one step darker, which
-  clears the threshold with room to spare, keeps that family at one tier,
-  and deepens every light-theme chip, badge and button that uses those
-  hues by the same step. The dark theme is unchanged.
+- **Clearer pane controls.** Each tab has a dismiss button: `−` hides a regular split pane while
+  keeping its tab; `×` closes a closable tab or preview. A chevron opens the pane menu with mouse
+  or keyboard. The active tab and pane agree visually, hidden tabs remain closable, and controls
+  stay visible when the tab strip overflows.
+- **Reasoning progress with elapsed time.** Interactive and coordinator views share a Reasoning
+  indicator and live clock in both Default and Compact modes. The clock measures what the browser
+  observed; restored history does not invent a duration.
+- **More readable light-theme indicators (#1092, #1094).** Darker accent colors improve contrast for
+  launcher labels, badges, buttons, and approval reminders.
+
+### Fixed
+
+- **Schedule dispatch and completion (#1099).** A firing is recorded as successful only after a node
+  creates the workstream. Definite failures retry about once a minute for five minutes, keeping
+  that deadline across console restarts. Uncertain results and partial fan-out success are reported
+  without retrying jobs that may already be running. One-shot status reflects whether the run
+  happened, including after re-arming or conversion from cron.
+- **One-shot times and schedule validation (#1096, #1098).** One-shot schedules honor their UTC
+  offset, including schedules stored before upgrading. Explicit null fields are rejected with
+  the field named, preventing accidental disabling or names saved as `"None"`.
+- **Discord and Slack conversation recovery (#1067).** Restarts, idle eviction, and missing event
+  streams no longer discard a channel's saved conversation. The next authorized message restores its
+  history and subscription. Recovery uses the exact saved identity and preserves the route when a
+  node is temporarily unreachable; concurrent recovery cannot overwrite another replacement.
+- **Persistent node placement (#1106).** A workstream explicitly assigned to a node stays there
+  after restart, close, idle timeout, or eviction. Reopening and routing honor that requirement
+  instead of silently moving execution. Forks inherit it unless a new destination is chosen.
+- **Reopening without an extra turn.** Restoring a workstream no longer launches a redundant
+  memory search. A message sent during reopening starts its own turn.
+- **Empty model completions (#1070).** A response with no answer or tool call now retries within a
+  bounded budget when no server-side tools may have run. Otherwise it reports an actionable error
+  instead of silently completing. Provider refusals remain visible.
+- **MCP timeouts (#951).** A caller's wait deadline cancels its local waiter without marking the
+  server unhealthy or opening its circuit breaker. Server-reported timeouts still count as failures.
+- **MCP OAuth registration and refresh (#1081, #1082).** Servers keep their resolved issuer when
+  discovery metadata comes from cache, so token refresh uses the right issuer. Client registration
+  no longer sends an unrelated resource parameter that authorization servers may reject.
+- **Shared Docker authentication setup (#1062, #1064).** Both Docker stacks can mount one private
+  `config.toml` for the console and nodes, sharing the encryption key and callback configuration for
+  MCP OAuth. The installer can prepare it once and preserves it on reruns. The guides cover local
+  login, SSO, delegated access, and remote callback registration.
+- **Operator access to saved history.** Authorized project members can list and reopen interactive
+  history without coordinator administration permissions. Read-only users can inspect and export
+  history; reopening or deleting requires write access. Nodes also enforce project and coordinator
+  permissions when requests arrive directly or through the console.
+- **Sign-in recovery on page load.** Rejected or outdated credentials reliably return the browser to
+  sign-in, including when the initial identity check races other requests. An older response cannot
+  erase a newer authenticated session.
+
+### Security
+
+- **Session creation and renewal use current permissions.** Password and OIDC sessions require
+  active role permissions. Permission-store outages return a retryable error without extending stale
+  permissions or clearing the existing cookie. Only human password/OIDC sessions can renew through
+  the public refresh endpoint. API-token sessions retain their explicit scopes and fixed expiry;
+  login no longer exchanges JWTs for fresh sessions. `turnstone-admin create-user` assigns viewer
+  access explicitly.
+- **Discord thread ownership survives recovery.** Only the original linked invoker can continue or
+  close the conversation. Another linked user cannot claim a bot-owned thread.
 
 ## [1.8.2]
 
