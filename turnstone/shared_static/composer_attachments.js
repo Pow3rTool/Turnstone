@@ -75,6 +75,54 @@ export function kindIcon(kind) {
   return "📄"; // pdf + text
 }
 
+// Tool pixels stay out of SSE/history JSON. Resolve only stored, ws-scoped
+// image references, on demand. Reopening retries a failed/pending commit.
+export function buildToolImages(attachments, opts) {
+  const images = Array.isArray(attachments)
+    ? attachments.filter((a) => a && a.kind === "image" && a.attachment_id)
+    : [];
+  if (!images.length || !opts.wsId) return null;
+  const details = document.createElement("details");
+  details.className = "tool-images";
+  const summary = document.createElement("summary");
+  summary.textContent =
+    images.length === 1 ? "View image" : "View " + images.length + " images";
+  details.appendChild(summary);
+  const body = document.createElement("div");
+  details.appendChild(body);
+  details.addEventListener("toggle", () => {
+    if (!details.open) return;
+    body.replaceChildren();
+    images.forEach((a) => {
+      const url = _attachUrl(
+        opts.base || "",
+        opts.wsId,
+        a.attachment_id,
+        "/content",
+      );
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.title = "Open full image";
+      const img = document.createElement("img");
+      img.alt = a.filename || "Tool image";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.style.maxWidth = "100%";
+      img.style.maxHeight = "480px";
+      img.style.objectFit = "contain";
+      img.src = url;
+      img.addEventListener("error", () => {
+        link.textContent = "Image unavailable. Close and reopen to retry.";
+      });
+      link.appendChild(img);
+      body.appendChild(link);
+    });
+  });
+  return details;
+}
+
 // Build an inline preview node for a committed attachment (real id), or null.
 // image/pdf → server-rendered thumbnail; audio → <audio> player; text → a lazy
 // snippet.  Auth is cookie-based, so a plain media `src` works same-origin.
