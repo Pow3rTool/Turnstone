@@ -12,6 +12,24 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
+## [1.8.4]
+
+### Fixed
+
+- **Conversation reading position (#1133).** Scrolling up pauses automatic scrolling in interactive
+  and coordinator conversations, including during tool updates, history reloads, and compact-view
+  folding. Scrolling near the bottom, choosing Jump to latest, or sending a message resumes it.
+- **Notification authentication (#1137).** Nodes with `[auth].jwt_secret` in `config.toml` now use
+  that secret for tool and completion notifications, resolving HTTP 401 failures when the secret
+  is absent from the environment. Gateway and authentication diagnostics identify failed attempts
+  without exposing credentials or notification content.
+
+### Security
+
+- Raise the HTTPX2 minimum to 2.12.0 for multipart header injection, ambiguous request framing,
+  and response decompression memory fixes. Update the TypeScript SDK's Vitest lock to 4.1.11
+  for its development-server path traversal fix.
+
 ## [1.8.3]
 
 Turnstone 1.8.3 makes scheduled work easier to launch, keeps conversations and node placement intact
